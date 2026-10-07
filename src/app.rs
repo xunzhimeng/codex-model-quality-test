@@ -1,5 +1,5 @@
 use crate::{
-    probe,
+    accounts, monitor, probe,
     questions::{self, Question},
     store::{self, CustomBank, History, Record, metadata_call, now_ms, payload_call},
 };
@@ -26,6 +26,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 type Response = TypedReply<ManagementResponse>;
 pub struct App {
+    pub monitor: monitor::Monitor,
     history: AsyncMutex<()>,
     bank: AsyncMutex<()>,
     slots: Arc<Semaphore>,
@@ -34,6 +35,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            monitor: monitor::Monitor::default(),
             history: AsyncMutex::new(()),
             bank: AsyncMutex::new(()),
             slots: Arc::new(Semaphore::new(4)),
@@ -167,6 +169,7 @@ impl App {
         let host = &call.host;
         match (call.request.method.as_str(), call.request.path.as_str()) {
             ("GET", "catalog") => {
+                let info = accounts::list(host).await?;
                 let mut accounts = Vec::new();
                 let mut cursor = None;
                 loop {
@@ -180,7 +183,10 @@ impl App {
                         },
                     )
                     .await?;
-                    accounts.extend(page.accounts.into_iter().map(|a| json!({"id":a.account_id,"name":a.name,"provider":a.provider_id,"authentication_kind":a.authentication_kind,"enabled":a.enabled,"probe_supported":probe::eligibility(&a).is_ok()})));
+                    for a in page.accounts {
+                        let identity = info.get(&a.account_id).ok_or("账号目录已变化，请刷新")?;
+                        accounts.push(json!({"id":a.account_id,"name":accounts::label(&a,identity),"email":a.email,"provider":a.provider_id,"authentication_kind":a.authentication_kind,"enabled":a.enabled,"probe_supported":probe::eligibility(&a).is_ok()}));
+                    }
                     cursor = page.next_cursor;
                     if cursor.is_none() {
                         break;
@@ -256,29 +262,43 @@ impl App {
                 .await?;
                 json_response(200, &json!({"saved":true}))
             }
+            ("GET", "monitor") => json_response(200, &self.monitor.snapshot(host).await?),
+            ("POST", "monitor") => {
+                let request: monitor::Save = decode(&call.payload)?;
+                json_response(200, &self.monitor.save(host, request).await?)
+            }
             ("POST", "run") => {
                 let request: RunRequest = decode(&call.payload)?;
                 request.validate()?;
-                self.run(&call, request).await
+                let generation = if request.mode == "probe" {
+                    self.monitor
+                        .generation(host, &request.account_id, &request.model)
+                        .await?
+                } else {
+                    None
+                };
+                self.run(host, request, 90, generation, false).await
             }
             _ => json_response(404, &json!({"error":"请求未注册"})),
         }
     }
 
-    async fn run(
+    pub(crate) async fn run(
         &self,
-        call: &TypedCall<ManagementRequest>,
+        host: &HostClient,
         request: RunRequest,
+        timeout_seconds: u64,
+        monitor_generation: Option<String>,
+        scheduled: bool,
     ) -> Result<Response, String> {
-        let host = &call.host;
         let _slot = match self.slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
-            Err(_) => return json_response(429, &json!({"error":"最多同时运行4个测试"})),
+            Err(_) => return Err("最多同时运行4个测试".into()),
         };
         {
             let mut accounts = self.accounts.lock().map_err(|_| "账号测试锁不可用")?;
             if !accounts.insert(request.account_id.clone()) {
-                return json_response(409, &json!({"error":"该账号已有测试在执行"}));
+                return Err("该账号已有测试在执行".into());
             }
         }
         let _account = AccountGuard {
@@ -291,6 +311,15 @@ impl App {
             let (history, _) = store::get::<History>(host, "history").await?;
             if let Some(record) = history.records.iter().find(|r| r.id == request.id) {
                 return json_response(200, &json!({"record":record,"replayed":true}));
+            }
+        }
+        if let Some(generation) = &monitor_generation {
+            let current = self
+                .monitor
+                .begin(host, &request.account_id, generation)
+                .await?;
+            if scheduled && !current {
+                return Err("计划已变更，本轮未执行".into());
             }
         }
         let account: AuthRuntimeAccount = payload_call(
@@ -316,12 +345,13 @@ impl App {
             probe::eligibility(&account).map_err(str::to_owned)?;
             None
         };
+        let identity = accounts::get(host, &account.account_id).await?;
         let started = now_ms();
         let record = Record {
             id: request.id.clone(),
             batch_id: request.batch_id.clone(),
             account_id: account.account_id.clone(),
-            account_name: account.name.clone(),
+            account_name: accounts::label(&account, &identity),
             mode: request.mode.clone(),
             model: request.model.clone(),
             effort: request.effort.clone(),
@@ -348,7 +378,7 @@ impl App {
                     && r.status == "running"
                     && started.saturating_sub(r.started_at_ms) < 150_000
             }) {
-                return json_response(409, &json!({"error":"该账号有未确认测试，请稍后查询历史"}));
+                return Err("该账号有未确认测试，请稍后查询历史".into());
             }
             history.append(record.clone())?;
             store::put(host, "history", &history, version).await?;
@@ -357,18 +387,24 @@ impl App {
             guard: Some((_account, _slot)),
             completed: false,
         };
-        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
-            if let Some(q) = question {
-                execute_question(host, &request, &q).await
-            } else {
-                probe::run(host, &account, &request.model)
-                    .await
-                    .map(|r| (r.status, None, r.detail, r.metrics))
-            }
-        })
-        .await
-        .unwrap_or_else(|_| Err("测试超时，无法判断，未自动重试".into()));
-        pending.completed = outcome.is_ok();
+        let outcome = if let Some(q) = question {
+            tokio::time::timeout(
+                Duration::from_secs(timeout_seconds),
+                execute_question(host, &request, &q),
+            )
+            .await
+            .unwrap_or_else(|_| Err("测试超时，无法判断，未自动重试".into()))
+        } else {
+            let r = probe::run(
+                host,
+                &account,
+                &request.model,
+                Duration::from_secs(timeout_seconds),
+            )
+            .await;
+            Ok((r.status, None, r.detail, r.metrics))
+        };
+        pending.completed = matches!(&outcome,Ok((status,_,_,_)) if status!="inconclusive");
         let mut record = record;
         record.finished_at_ms = Some(now_ms());
         record.latency_ms = Some(now_ms().saturating_sub(started));
@@ -388,6 +424,12 @@ impl App {
                 .into();
                 record.detail = error;
             }
+        }
+        record.metrics["source"] = json!(if scheduled { "scheduled" } else { "manual" });
+        if let Some(generation) = monitor_generation
+            && let Err(error) = self.monitor.observe(host, &mut record, &generation).await
+        {
+            record.metrics["monitor"] = json!({"action":"unconfirmed","detail":error});
         }
         let _guard = self.history.lock().await;
         let (mut history, version) = store::get::<History>(host, "history").await?;

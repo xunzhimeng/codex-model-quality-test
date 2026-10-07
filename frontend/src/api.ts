@@ -1,5 +1,5 @@
 export interface Question { id: string; title: string; category: string; prompt: string; answer: string }
-export interface Account { id: string; name: string; provider: string; authentication_kind: string; enabled: boolean; probe_supported: boolean }
+export interface Account { id: string; name: string; email?: string | null; provider: string; authentication_kind: string; enabled: boolean; probe_supported: boolean }
 export interface Key { id: string; name: string; enabled: boolean }
 export interface Catalog { accounts: Account[]; keys: Key[]; questions: Question[]; bank_version: number | null; version: string }
 export interface TestRecord {

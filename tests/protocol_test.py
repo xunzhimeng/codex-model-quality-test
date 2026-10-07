@@ -33,7 +33,16 @@ class Host:
         self.ticket_second = 'ticket-new'
         self.bad_stream = False
         self.model_count = 0
-        self.write({'type':'hello','handshake':{'protocol_version':2,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'management':{'id':'xunzhimeng.model-quality-test.management','version':1,'stages':['management']}}}})
+        self.account_enabled = True
+        self.account_notes = '测试账号'
+        self.disable_count = 0
+        self.dispatch_status = 200
+        self.http_status = 200
+        self.fail_disable = False
+        self.body_streams = {}
+        self.on_stream = None
+        self.stall_stream = False
+        self.write({'type':'hello','handshake':{'protocol_version':2,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':1,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
         message,_ = self.messages.get(timeout=5)
         assert message['type'] == 'ready' and message['protocol_version'] == 2, message
@@ -59,7 +68,7 @@ class Host:
     def callback(self, msg, body):
         method=msg['method']; params=msg['params']; self.calls.append(method)
         result={}; payload=b''
-        account={'account_id':'fixture-account','provider_id':'openai','credential_revision':1,'name':'测试账号','email':None,'upstream_user_id':None,'upstream_account_id':'fixture-upstream','plan_type':'plus','authentication_kind':'oauth','enabled':True,'credential_state':'ready','has_refresh_token':False,'access_token_expires_at_ms':None,'next_refresh_at_ms':None}
+        account={'account_id':'fixture-account','provider_id':'openai','credential_revision':1,'name':'OpenAI 账号','email':'fixture@example.test','upstream_user_id':None,'upstream_account_id':'fixture-upstream','plan_type':'plus','authentication_kind':'oauth','enabled':self.account_enabled,'credential_state':'ready','has_refresh_token':False,'access_token_expires_at_ms':None,'next_refresh_at_ms':None}
         if method.startswith('host.auth.'):
             assert params=={}; request=json.loads(body)
             if method=='host.auth.list': payload=dump({'accounts':[account],'next_cursor':None})
@@ -86,6 +95,32 @@ class Host:
             assert self.states['history']['value']['records'][-1]['status']=='running'
             self.model_count+=1
             result={'request_id':'fixture-request','events':1}; payload=events()
+        elif method=='host.http.dispatch':
+            from urllib.parse import urlsplit,parse_qs
+            assert params['settings'] is None
+            assert not any(h['name'].lower() in ('authorization','cookie') for h in params['headers'])
+            uri=urlsplit(params['uri']); code=self.dispatch_status
+            if uri.path=='/api/admin/accounts':
+                assert params['method']=='GET' and not body
+                assert set(parse_qs(uri.query))=={'page','pageSize'}
+                data={'items':[{'id':'fixture-account','name':'OpenAI 账号','email':'fixture@example.test','notes':self.account_notes,'enabled':self.account_enabled}], 'page':{'totalPages':1}}
+            elif uri.path=='/api/admin/accounts/batch-update':
+                assert params['method']=='POST'
+                assert json.loads(body)=={'accountIds':['fixture-account'],'enabled':False}
+                assert self.states['monitor']['value']['accounts']['fixture-account']['action']=='pending'
+                self.disable_count+=1
+                if self.fail_disable: code=503
+                else: self.account_enabled=False
+                data={'count':1}
+            else: raise AssertionError('unexpected admin route '+uri.path)
+            handle=f'admin-{len(self.body_streams)}'
+            self.body_streams[handle]=dump({'code':200,'message':'OK','data':data})
+            result={'status':code,'version':'HTTP/1.1','headers':[],'body':{'kind':'handle','handle':handle},'response':None,'session':False}
+        elif method=='host.http.body_read':
+            data=self.body_streams[params['handle']]
+            result={'eof':data is None,'trailers':None}; payload=data or b''
+            self.body_streams[params['handle']]=None
+        elif method=='host.http.body_close': result={}
         elif method=='host.http.do_stream':
             assert params['url']=='https://chatgpt.com/backend-api/codex/responses'
             assert json.loads(body)['stream'] is True
@@ -94,7 +129,9 @@ class Host:
             ticket='ticket-first' if number%2 else self.ticket_second
             response_headers=[['x-codex-turn-state',ticket],['set-cookie','__oailb=route-fixture; Secure; HttpOnly'],['set-cookie','other=not-forwarded; Secure']]
             self.streams[stream]=0
-            result={'status':200,'headers':response_headers,'stream':stream}
+            if self.on_stream: self.on_stream()
+            if self.stall_stream: return
+            result={'status':self.http_status,'headers':response_headers,'stream':stream}
         elif method=='host.http.stream_read':
             stream=params['stream']; number=self.streams[stream]; self.streams[stream]+=1
             if number==0:
@@ -109,9 +146,10 @@ class Host:
             assert (method, path) in self.routes, 'request is not a registered relative route'
         id=self.next_id; self.next_id+=2
         params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None,'headers':[{'name':'authorization','value':list(b'fixture-admin-not-real')}]}
-        self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':120000,'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
+        self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':30000 if stage=='maintenance' else 120000,'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
         while True:
-            msg,payload=self.messages.get(timeout=10)
+            msg,payload=self.messages.get(timeout=35)
+            if msg['type']=='cancel': continue
             if msg['type']=='callback': self.callback(msg,payload); continue
             assert msg['type']=='result', msg
             assert msg['id']==id, msg
@@ -128,6 +166,103 @@ class Integration(unittest.TestCase):
     def tearDown(self): self.host.close()
     def run_request(self,id,mode='question'):
         return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':'fixture-model','effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key' if mode=='question' else None,'question_id':'candy' if mode=='question' else None})
+    def configure_monitor(self,scheduled=True,auto_disable=True):
+        snapshot=self.host.call('GET','monitor')[1]
+        status,result=self.host.call('POST','monitor',{'settings':{'scheduled':scheduled,'auto_disable':auto_disable,'interval_minutes':30,'model':'fixture-model','account_ids':['fixture-account']},'expected_generation':snapshot['state']['generation'] or None})
+        self.assertEqual(status,200,result)
+        return result
+    def due(self):
+        state=self.host.states['monitor']['value']
+        state['accounts']['fixture-account']['next_due_ms']=0
+    def test_background_timeout_preserves_details_without_disabling(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.host.stall_stream=True;self.due();started=time.monotonic()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        elapsed=time.monotonic()-started;self.assertGreaterEqual(elapsed,17);self.assertLess(elapsed,29)
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(record['status'],'inconclusive');self.assertGreaterEqual(record['metrics']['rounds'][0]['elapsed_ms'],17000)
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
+        self.assertEqual(self.host.disable_count,0)
+    def test_monitor_defaults_do_not_probe(self):
+        self.assertEqual(self.host.call('plugin.reconcile',stage='maintenance'),{})
+        self.assertEqual(len(self.host.http),0)
+        self.assertEqual(self.host.disable_count,0)
+    def test_background_two_degraded_disables_once(self):
+        self.configure_monitor();self.due()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,0)
+        s=self.host.states['monitor']['value']['accounts']['fixture-account'];self.assertEqual(s['streak'],1)
+        # 同一到期时间只消费一次，维护回调重入不重发。
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(len(self.host.http),2)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,1);self.assertFalse(self.host.account_enabled)
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['action'],'disabled')
+        self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(len(self.host.http),4)
+        self.assertEqual(self.host.disable_count,1)
+    def test_manual_opt_in_and_failure_does_not_disable(self):
+        self.configure_monitor(scheduled=False)
+        self.run_request('fixture-monitor-1','probe');self.assertEqual(self.host.disable_count,0)
+        self.host.http_status=429
+        result=self.run_request('fixture-monitor-2','probe')[1]['record']
+        self.assertEqual(result['status'],'inconclusive');self.assertEqual(result['metrics']['rounds'][0]['http_status'],429)
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
+        self.assertEqual(self.host.disable_count,0)
+    def test_stale_settings_and_inflight_switch_off(self):
+        config=self.configure_monitor()
+        status,_=self.host.call('POST','monitor',{'settings':config['state']['settings'],'expected_generation':None});self.assertEqual(status,400)
+        self.run_request('fixture-toggle-1','probe')
+        def change():
+            state=self.host.states['monitor'];state['value']['generation']='different';state['value']['settings']['auto_disable']=False;state['version']+=1
+        self.host.on_stream=change
+        self.run_request('fixture-toggle-2','probe');self.assertEqual(self.host.disable_count,0)
+    def test_disable_failure_keeps_unconfirmed_and_no_retry(self):
+        self.configure_monitor(scheduled=False);self.host.fail_disable=True
+        self.run_request('fixture-action-1','probe');result=self.run_request('fixture-action-2','probe')[1]['record']
+        self.assertEqual(self.host.disable_count,1);self.assertEqual(result['metrics']['monitor']['action'],'unconfirmed')
+        self.run_request('fixture-action-3','probe');self.assertEqual(self.host.disable_count,1)
+    def test_safe_identity_and_preserved_history_name(self):
+        self.host.account_notes='账号别称'
+        self.assertEqual(self.host.call('GET','catalog')[1]['accounts'][0]['name'],'账号别称')
+        record=self.run_request('fixture-name-1','probe')[1]['record'];self.assertEqual(record['account_name'],'账号别称')
+        self.host.account_notes=None
+        self.assertEqual(self.host.call('GET','catalog')[1]['accounts'][0]['name'],'fixture@example.test')
+    def test_monitor_state_survives_process_restart(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        states=self.host.states
+        self.host.close();self.host=Host();self.host.states=states
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(len(self.host.http),0)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.disable_count,1)
+    def test_status_ticks_do_not_conflict_with_settings_edit(self):
+        config=self.configure_monitor()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        status,result=self.host.call('POST','monitor',{'settings':config['state']['settings'],'expected_generation':config['state']['generation']})
+        self.assertEqual(status,200,result)
+    def test_healthy_and_interrupted_round_reset_streak(self):
+        self.configure_monitor(scheduled=False)
+        self.run_request('fixture-streak-1','probe')
+        self.host.ticket_second='ticket-first'
+        self.run_request('fixture-streak-2','probe')
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
+        self.host.ticket_second='ticket-new'
+        self.run_request('fixture-streak-3','probe')
+        self.host.states['monitor']['value']['accounts']['fixture-account']['last_status']='running'
+        self.run_request('fixture-streak-4','probe')
+        self.assertEqual(self.host.disable_count,0)
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],1)
+    def test_manually_restored_account_starts_new_cycle(self):
+        self.configure_monitor(scheduled=False)
+        self.run_request('fixture-restore-1','probe');self.run_request('fixture-restore-2','probe')
+        self.assertEqual(self.host.disable_count,1)
+        self.host.account_enabled=True
+        self.run_request('fixture-restore-3','probe');self.assertEqual(self.host.disable_count,1)
+        self.run_request('fixture-restore-4','probe');self.assertEqual(self.host.disable_count,2)
+    def test_probe_details_cover_both_rounds_without_secrets(self):
+        r=self.run_request('fixture-details','probe')[1]['record']
+        rounds=r['metrics']['rounds'];self.assertEqual(len(rounds),2)
+        self.assertTrue(all(x['completed'] and x['http_status']==200 and x['ticket_length']>0 for x in rounds))
+        self.assertTrue(all(x['response_bytes']>0 and x['routing_cookie_count']==1 for x in rounds))
+        self.assertNotIn('ticket-first',dump(r).decode())
+        self.assertNotIn('fixture-token-not-real',dump(r).decode())
     def test_registration_catalog_model_and_persistent_replay(self):
         with self.assertRaises(AssertionError):
             self.host.call('GET', '/catalog')

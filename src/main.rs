@@ -1,4 +1,6 @@
+mod accounts;
 mod app;
+mod monitor;
 mod probe;
 mod questions;
 mod store;
@@ -7,7 +9,7 @@ use gateway_plugin_sdk::{
     call::management::{
         ManagementPage, ManagementRegistration, ManagementResource, ManagementRoute,
     },
-    client::{PluginBuilder, PluginSession, SessionConfig},
+    client::{Empty, PluginBuilder, PluginSession, SessionConfig, TypedReply, methods},
 };
 use std::sync::Arc;
 
@@ -19,6 +21,8 @@ fn registration() -> ManagementRegistration {
             ("GET", "history"),
             ("POST", "questions"),
             ("POST", "run"),
+            ("GET", "monitor"),
+            ("POST", "monitor"),
         ]
         .into_iter()
         .map(|(method, path)| ManagementRoute {
@@ -58,7 +62,20 @@ fn registration() -> ManagementRegistration {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Arc::new(app::App::default());
+    let maintenance = app.clone();
     let plugin = PluginBuilder::from_json(include_bytes!("../plugin.json"))?
+        .on(methods::RECONCILE, move |call| {
+            let app = maintenance.clone();
+            async move {
+                app.monitor.tick(&app, &call.host).await.map_err(|error| {
+                    gateway_plugin_sdk::PluginFault::new(
+                        gateway_plugin_sdk::ErrorCode::Fault,
+                        error,
+                    )
+                })?;
+                Ok(TypedReply::new(Empty {}))
+            }
+        })?
         .management(registration(), move |call| {
             let app = app.clone();
             async move {
@@ -128,6 +145,10 @@ mod tests {
         let builder = PluginBuilder::from_json(include_bytes!("../plugin.json")).unwrap();
         assert!(
             builder
+                .on(methods::RECONCILE, |_| async {
+                    Ok(TypedReply::new(Empty {}))
+                })
+                .unwrap()
                 .management(registration(), |_| async {
                     app::json_response(200, &serde_json::json!({})).map_err(|_| {
                         gateway_plugin_sdk::PluginFault::new(
