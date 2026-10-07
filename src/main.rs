@@ -1,0 +1,110 @@
+mod app;
+mod probe;
+mod questions;
+mod store;
+
+use gateway_plugin_sdk::{
+    call::management::{
+        ManagementPage, ManagementRegistration, ManagementResource, ManagementRoute,
+    },
+    client::{PluginBuilder, PluginSession, SessionConfig},
+};
+use std::sync::Arc;
+
+fn registration() -> ManagementRegistration {
+    ManagementRegistration {
+        routes: [
+            ("GET", "/catalog"),
+            ("POST", "/models"),
+            ("GET", "/history"),
+            ("POST", "/questions"),
+            ("POST", "/run"),
+        ]
+        .into_iter()
+        .map(|(method, path)| ManagementRoute {
+            method: method.into(),
+            path: path.into(),
+            request_content_types: if method == "POST" {
+                vec!["application/json".into()]
+            } else {
+                vec![]
+            },
+            response_content_types: vec!["application/json".into()],
+        })
+        .collect(),
+        resources: [
+            "web/index.html",
+            "web/app.js",
+            "web/style.css",
+            "web/icon.svg",
+        ]
+        .into_iter()
+        .map(|path| ManagementResource {
+            path: path.into(),
+            public: false,
+        })
+        .collect(),
+        pages: vec![ManagementPage {
+            id: "quality".into(),
+            title: "模型质量测试".into(),
+            description: Some("多题测试与OAuth门票探针".into()),
+            entry: "web/index.html".into(),
+            icon: None,
+        }],
+        callbacks: vec![],
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Arc::new(app::App::default());
+    let plugin = PluginBuilder::from_json(include_bytes!("../plugin.json"))?
+        .management(registration(), move |call| {
+            let app = app.clone();
+            async move {
+                match app.handle(call).await {
+                    Ok(reply) => Ok(reply),
+                    Err(error) => app::json_response(400, &serde_json::json!({"error":error}))
+                        .map_err(|_| {
+                            gateway_plugin_sdk::PluginFault::new(
+                                gateway_plugin_sdk::ErrorCode::Fault,
+                                "响应编码失败",
+                            )
+                        }),
+                }
+            }
+        })?
+        .build()?;
+    PluginSession::accept(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        SessionConfig::default(),
+    )
+    .await?
+    .run(plugin)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn manifest_and_registration_agree() {
+        let builder = PluginBuilder::from_json(include_bytes!("../plugin.json")).unwrap();
+        assert!(
+            builder
+                .management(registration(), |_| async {
+                    app::json_response(200, &serde_json::json!({})).map_err(|_| {
+                        gateway_plugin_sdk::PluginFault::new(
+                            gateway_plugin_sdk::ErrorCode::Fault,
+                            "编码失败",
+                        )
+                    })
+                })
+                .unwrap()
+                .build()
+                .is_ok()
+        );
+    }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "model-quality-test-web",
+  "private": true,
+  "type": "module",
+  "scripts": { "typecheck": "vue-tsc --noEmit", "build": "vue-tsc --noEmit && vite build", "test": "node --test tests/*.test.mjs" },
+  "dependencies": { "vue": "3.5.43" },
+  "devDependencies": { "@vitejs/plugin-vue": "6.0.9", "typescript": "6.0.3", "vite": "8.3.0", "vue-tsc": "3.3.11" }
+}

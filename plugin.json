@@ -1,0 +1,30 @@
+{
+  "manifestVersion": 1,
+  "publisher": "xunzhimeng",
+  "name": "model-quality-test",
+  "displayName": "模型质量测试",
+  "version": "0.1.0",
+  "description": "多题推理测试、OpenAI OAuth 门票探针与账号对比",
+  "license": "MIT",
+  "engines": { "codex-proxy-rs": ">=3.15.2, <4.0.0" },
+  "runtime": "trustedProcess",
+  "main": "bin/model-quality-test",
+  "contributes": { "management": {} },
+  "permissions": ["models", "accounts", "network"],
+  "configurationSchema": { "type": "object", "additionalProperties": false, "properties": {} },
+  "resources": {
+    "web/index.html": "text/html",
+    "web/app.js": "text/javascript",
+    "web/style.css": "text/css",
+    "web/icon.svg": "image/svg+xml"
+  },
+  "icon": "web/icon.svg",
+  "state": [{
+    "namespace": "quality",
+    "schemaVersion": 1,
+    "schema": { "type": "object" },
+    "maximumRecords": 2,
+    "maximumBytes": 1048576,
+    "maximumValueBytes": 262144
+  }]
+}
