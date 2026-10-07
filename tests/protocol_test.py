@@ -19,7 +19,7 @@ def events(answer='21'):
         {'type':'text_delta','index':0,'text':answer},
         {'type':'completed','id':'fixture','model':'fixture-model','reason':'stop'}
     ]})
-    event = b'GPE1' + struct.pack('>II', len(metadata), 0) + metadata
+    event = b'GPE2' + struct.pack('>III', len(metadata), 0, 0) + metadata
     return b'HME1' + struct.pack('>II', 1, len(event)) + event
 
 class Host:
@@ -33,10 +33,10 @@ class Host:
         self.ticket_second = 'ticket-new'
         self.bad_stream = False
         self.model_count = 0
-        self.write({'type':'hello','handshake':{'protocol_version':1,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'permissions':['models','accounts','network'],'contributes':{'management':{'id':'xunzhimeng.model-quality-test.management','version':1,'stages':['management']}}}})
+        self.write({'type':'hello','handshake':{'protocol_version':2,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'management':{'id':'xunzhimeng.model-quality-test.management','version':1,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
         message,_ = self.messages.get(timeout=5)
-        assert message['type'] == 'ready', message
+        assert message['type'] == 'ready' and message['protocol_version'] == 2, message
         self.next_id = 11
     def write(self, metadata, payload=b''):
         data=dump(metadata)
@@ -101,14 +101,15 @@ class Host:
         self.write({'type':'result','id':msg['id'],'result':result},payload)
     def call(self, method, path=None, body=None, stage='management'):
         id=self.next_id; self.next_id+=2
-        params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None}
-        self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':120000,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
+        params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None,'headers':[{'name':'authorization','value':list(b'fixture-admin-not-real')}]}
+        self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':120000,'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
         while True:
             msg,payload=self.messages.get(timeout=10)
             if msg['type']=='callback': self.callback(msg,payload); continue
             assert msg['type']=='result', msg
             assert msg['id']==id, msg
             if path is None:return json.loads(payload) if payload else msg['result']
+            assert msg['result']['headers']==[]
             return msg['result']['status'],json.loads(payload)
     def close(self):
         self.write({'type':'shutdown'}); self.process.wait(timeout=5)
@@ -132,7 +133,7 @@ class Integration(unittest.TestCase):
         status,result=self.run_request('fixture-probe','probe'); self.assertEqual(status,200); self.assertEqual(result['record']['status'],'degraded')
         self.assertNotIn('x-codex-turn-state',self.host.http[0]); self.assertNotIn('cookie',self.host.http[0])
         self.assertEqual(self.host.http[1]['x-codex-turn-state'],'ticket-first'); self.assertEqual(self.host.http[1]['cookie'],'__oailb=route-fixture')
-        state=dump(self.host.states).decode(); self.assertNotIn('ticket-first',state);self.assertNotIn('fixture-token-not-real',state);self.assertNotIn('route-fixture',state)
+        state=dump(self.host.states).decode(); self.assertNotIn('ticket-first',state);self.assertNotIn('fixture-token-not-real',state);self.assertNotIn('route-fixture',state);self.assertNotIn('fixture-admin-not-real',state)
     def test_failed_stream_is_inconclusive(self):
         self.host.bad_stream=True
         self.assertEqual(self.run_request('fixture-failed','probe')[1]['record']['status'],'inconclusive')

@@ -26,9 +26,9 @@
 
 ## 使用
 
-目标宿主为 CPR **3.15.2 至 4.0.0 之前版本**，SDK 固定引用 `zyycn/codex-proxy-rs@1c6b5a8f1045781d31a301382f1182f1a5657ec8`。实际宿主版本仍须在安装前核对。Linux Docker 安装包必须与宿主容器架构匹配，不是浏览器电脑的架构。
+目标宿主为 **CPR 3.21.1**，SDK 固定引用该正式版提交 `zyycn/codex-proxy-rs@f174320e2ac8987578146d4684e69ad196db0286`，使用清单格式 2 和进程协议 2。不宣称兼容未经验证的宿主版本。Linux Docker 安装包必须与宿主容器架构匹配，不是浏览器电脑的架构。
 
-在 CPR 插件管理中上传相应 `.tar.gz`，查看并接受 `models`、`accounts`、`network` 三个访问域，再启用并打开「模型质量测试」。仅声明 `management` 能力，不需要请求绑定。插件为 `trustedProcess`，与宿主使用相同系统身份，并非 OS 沙箱。
+在 CPR 插件管理中选择 GitHub 来源 `xunzhimeng/codex-model-quality-test`，指定标签 `v0.1.1`，或上传相应 `.tar.gz`，查看来源后安装并启用，再打开「模型质量测试」。旧版 `v0.1.0` 使用清单格式及协议 1，无法在 CPR 3.21.1 安装，请勿选择该包。仅声明 `management` 能力，不需要请求绑定。新版合同已移除 `permissions` 声明，安装并启用表示完全信任插件代码。插件为 `trustedProcess`，与宿主使用相同系统身份，并非 OS 沙箱。
 
 题目测试需选择启用的客户端 Key。模型下拉来源为该 Key 的可见目录，指定账号也须满足 Key 的账号组、模型权限及宿主资格。题目调用经过 Core 的准入、账号代理、租约、重试与计费链。插件自身不额外重试，每题一次逻辑模型调用不保证上游仅发生一次尝试。
 
@@ -86,4 +86,4 @@ cpr-plugin package --manifest plugin.json --binary target/x86_64-unknown-linux-g
 
 Rust 使用公开 SDK，不依赖宿主内部模块。协议集成测试启动真实插件进程，宿主回调全部为内存桩，不使用真实令牌或发送上游请求；Windows 和 Linux 本机构建产物均可测试。前端为 Vue SFC + TypeScript，通过 Vite 生成随包资源，不借用宿主 Vue 实例。
 
-Docker 环境采用现有 `cpr-plugin` CLI 打包，CLI 仅校验和生成安装包，不编译插件。ARM64 环境需改用 `aarch64-unknown-linux-gnu`，不能只更改包的平台声明。
+打包工具必须与目标宿主合同一致，使用 `v3.21.1` 源码构建的 `cpr-plugin`，不要复用旧版协议 1 的打包工具。CLI 仅校验和生成安装包，不编译插件。ARM64 环境需改用 `aarch64-unknown-linux-gnu`，不能只更改包的平台声明。

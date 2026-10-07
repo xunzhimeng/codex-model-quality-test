@@ -151,6 +151,7 @@ pub fn json_response(status: u16, value: &impl Serialize) -> Result<Response, St
     Ok(TypedReply::new(ManagementResponse {
         status,
         content_type: "application/json".into(),
+        headers: vec![],
     })
     .with_payload(serde_json::to_vec(value).map_err(|_| "响应编码失败")?))
 }
@@ -211,7 +212,7 @@ impl App {
                 bank.extend(custom.questions);
                 json_response(
                     200,
-                    &json!({"accounts":accounts,"keys":keys,"questions":bank,"bank_version":version,"version":"0.1.0"}),
+                    &json!({"accounts":accounts,"keys":keys,"questions":bank,"bank_version":version,"version":env!("CARGO_PKG_VERSION")}),
                 )
             }
             ("POST", "/models") => {
@@ -225,7 +226,8 @@ impl App {
                     &ModelListRequest {
                         client_key_id: request.client_key_id,
                         protocol: "openai".into(),
-                        client_version: "model-quality-test/0.1.0".into(),
+                        client_version: concat!("model-quality-test/", env!("CARGO_PKG_VERSION"))
+                            .into(),
                     },
                 )
                 .await?;

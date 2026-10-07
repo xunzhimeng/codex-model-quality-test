@@ -124,7 +124,11 @@ async fn shot(
         ("originator".into(), "codex_cli_rs".into()),
         (
             "user-agent".into(),
-            "codex_cli_rs/0.155.0 (Linux; x86_64) model-quality-test/0.1.0".into(),
+            concat!(
+                "codex_cli_rs/0.155.0 (Linux; x86_64) model-quality-test/",
+                env!("CARGO_PKG_VERSION")
+            )
+            .into(),
         ),
         ("version".into(), "0.155.0".into()),
         ("session_id".into(), uuid::Uuid::new_v4().to_string()),
