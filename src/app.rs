@@ -166,7 +166,7 @@ impl App {
     pub async fn handle(&self, call: TypedCall<ManagementRequest>) -> Result<Response, String> {
         let host = &call.host;
         match (call.request.method.as_str(), call.request.path.as_str()) {
-            ("GET", "/catalog") => {
+            ("GET", "catalog") => {
                 let mut accounts = Vec::new();
                 let mut cursor = None;
                 loop {
@@ -215,7 +215,7 @@ impl App {
                     &json!({"accounts":accounts,"keys":keys,"questions":bank,"bank_version":version,"version":env!("CARGO_PKG_VERSION")}),
                 )
             }
-            ("POST", "/models") => {
+            ("POST", "models") => {
                 let request: ModelsRequest = decode(&call.payload)?;
                 if request.client_key_id.is_empty() || request.client_key_id.len() > 128 {
                     return Err("客户端Key无效".into());
@@ -233,11 +233,11 @@ impl App {
                 .await?;
                 json_response(200, &models)
             }
-            ("GET", "/history") => {
+            ("GET", "history") => {
                 let (history, _) = store::get::<History>(host, "history").await?;
                 json_response(200, &history)
             }
-            ("POST", "/questions") => {
+            ("POST", "questions") => {
                 let request: BankRequest = decode(&call.payload)?;
                 questions::validate_custom(&request.questions).map_err(str::to_owned)?;
                 let _guard = self.bank.lock().await;
@@ -256,7 +256,7 @@ impl App {
                 .await?;
                 json_response(200, &json!({"saved":true}))
             }
-            ("POST", "/run") => {
+            ("POST", "run") => {
                 let request: RunRequest = decode(&call.payload)?;
                 request.validate()?;
                 self.run(&call, request).await

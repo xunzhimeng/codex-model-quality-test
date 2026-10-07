@@ -14,11 +14,11 @@ use std::sync::Arc;
 fn registration() -> ManagementRegistration {
     ManagementRegistration {
         routes: [
-            ("GET", "/catalog"),
-            ("POST", "/models"),
-            ("GET", "/history"),
-            ("POST", "/questions"),
-            ("POST", "/run"),
+            ("GET", "catalog"),
+            ("POST", "models"),
+            ("GET", "history"),
+            ("POST", "questions"),
+            ("POST", "run"),
         ]
         .into_iter()
         .map(|(method, path)| ManagementRoute {
@@ -98,6 +98,29 @@ mod tests {
         assert_eq!(source["engines"]["codex-proxy-rs"], "=3.21.1");
         assert_eq!(source["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn management_paths_are_relative() {
+        // 管理路径挂在实例命名空间下，前导斜杠会被宿主作为空路径段拒绝。
+        let registration = registration();
+        let mut endpoints = std::collections::BTreeSet::new();
+        for route in &registration.routes {
+            assert!(!route.path.starts_with('/'));
+            assert!(route.path.split('/').all(|part| !part.is_empty()));
+            assert!(endpoints.insert((&route.method, &route.path)));
+        }
+        for resource in &registration.resources {
+            assert!(!resource.path.starts_with('/'));
+        }
+        for page in &registration.pages {
+            assert!(
+                registration
+                    .resources
+                    .iter()
+                    .any(|resource| resource.path == page.entry)
+            );
+        }
     }
 
     #[test]

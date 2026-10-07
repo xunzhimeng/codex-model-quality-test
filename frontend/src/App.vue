@@ -39,11 +39,11 @@ function label(status: string) { return ({ correct: '答对', wrong: '答错', f
 function seconds(ms: number | null) { return ms === null ? '—' : `${(ms / 1000).toFixed(2)} s` }
 function time(ms: number) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }) }
 function upsert(record: TestRecord) { const i = records.value.findIndex(r => r.id === record.id); if (i === -1) records.value.unshift(record); else records.value[i] = record }
-async function refreshHistory() { const history = await request<History>('/history'); records.value = [...history.records].reverse(); evicted.value = history.evicted }
+async function refreshHistory() { const history = await request<History>('history'); records.value = [...history.records].reverse(); evicted.value = history.evicted }
 async function reload() {
   error.value = ''; loading.value = true
   try {
-    catalog.value = await request<Catalog>('/catalog')
+    catalog.value = await request<Catalog>('catalog')
     customJson.value = JSON.stringify(catalog.value.questions.filter(q => q.id.startsWith('custom_')), null, 2)
     selectedAccounts.value = selectedAccounts.value.filter(id => catalog.value.accounts.some(a => a.id === id))
     if (!selectedQuestions.value.length) selectedQuestions.value = catalog.value.questions.map(q => q.id)
@@ -58,7 +58,7 @@ async function loadModels() {
   if (!key.value) return
   modelsLoading.value = true
   try {
-    const result = await request<{ models: string[] }>('/models', { client_key_id: key.value })
+    const result = await request<{ models: string[] }>('models', { client_key_id: key.value })
     if (version !== modelLoad) return
     models.value = result.models
     if (!models.value.includes(model.value)) model.value = models.value.includes('gpt-6-astra') ? 'gpt-6-astra' : models.value[0] || ''
@@ -80,7 +80,7 @@ async function run() {
     await runAccountQueue(accounts, tasks, Math.max(1, Math.min(4, concurrency.value)), async (account: Account, question: string | null) => {
       const operation = crypto.randomUUID()
       try {
-        const result = await request<{ record: TestRecord }>('/run', { id: operation, batch_id: id, account_id: account.id, ...settings, question_id: question })
+        const result = await request<{ record: TestRecord }>('run', { id: operation, batch_id: id, account_id: account.id, ...settings, question_id: question })
         upsert(result.record)
         if (result.record.status === 'running') { stopping.value = true; error.value = '测试结果未确认，请刷新历史后再操作' }
       } catch (e) {
@@ -96,7 +96,7 @@ async function saveBank() {
   try {
     const questions: Question[] = JSON.parse(customJson.value)
     if (!Array.isArray(questions)) throw new Error('题库须为JSON数组')
-    await request('/questions', { questions, expected_version: catalog.value.bank_version })
+    await request('questions', { questions, expected_version: catalog.value.bank_version })
     await reload(); notice.value = '自定义题库已保存'
   } catch (e) { error.value = (e as Error).message } finally { bankSaving.value = false }
 }

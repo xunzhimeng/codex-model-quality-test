@@ -38,6 +38,11 @@ class Host:
         message,_ = self.messages.get(timeout=5)
         assert message['type'] == 'ready' and message['protocol_version'] == 2, message
         self.next_id = 11
+        self.registration = self.call('management.register', stage='registration')
+        # 先检查相对路由，再按注册表分发，避免桩直接接受宿主会拒绝的路径。
+        self.routes = {(route['method'], route['path']) for route in self.registration['routes']}
+        assert len(self.routes) == len(self.registration['routes'])
+        assert all(path and not path.startswith('/') for _, path in self.routes)
     def write(self, metadata, payload=b''):
         data=dump(metadata)
         self.process.stdin.write(struct.pack('>IQ',len(data),len(payload))+data+payload)
@@ -100,6 +105,8 @@ class Host:
         else: raise AssertionError('unexpected callback '+method)
         self.write({'type':'result','id':msg['id'],'result':result},payload)
     def call(self, method, path=None, body=None, stage='management'):
+        if path is not None:
+            assert (method, path) in self.routes, 'request is not a registered relative route'
         id=self.next_id; self.next_id+=2
         params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None,'headers':[{'name':'authorization','value':list(b'fixture-admin-not-real')}]}
         self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':120000,'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
@@ -120,15 +127,17 @@ class Integration(unittest.TestCase):
     def setUp(self): self.host=Host()
     def tearDown(self): self.host.close()
     def run_request(self,id,mode='question'):
-        return self.host.call('POST','/run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':'fixture-model','effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key' if mode=='question' else None,'question_id':'candy' if mode=='question' else None})
+        return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':'fixture-model','effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key' if mode=='question' else None,'question_id':'candy' if mode=='question' else None})
     def test_registration_catalog_model_and_persistent_replay(self):
+        with self.assertRaises(AssertionError):
+            self.host.call('GET', '/catalog')
         reg=self.host.call('plugin.register',stage='registration'); self.assertIn('management',reg['contributes'])
         self.assertEqual(self.host.call('management.register',stage='registration')['pages'][0]['title'],'模型质量测试')
-        status,catalog=self.host.call('GET','/catalog'); self.assertEqual(status,200);self.assertEqual(len(catalog['questions']),10)
-        self.assertEqual(self.host.call('POST','/models',{'client_key_id':'fixture-key'})[1]['models'],['fixture-model'])
+        status,catalog=self.host.call('GET','catalog'); self.assertEqual(status,200);self.assertEqual(len(catalog['questions']),10)
+        self.assertEqual(self.host.call('POST','models',{'client_key_id':'fixture-key'})[1]['models'],['fixture-model'])
         status,answer=self.run_request('fixture-operation'); self.assertEqual(status,200); self.assertEqual(answer['record']['status'],'correct')
         self.assertEqual(self.run_request('fixture-operation')[1]['replayed'],True); self.assertEqual(self.host.model_count,1)
-        self.assertEqual(self.host.call('GET','/history')[1]['records'][0]['status'],'correct')
+        self.assertEqual(self.host.call('GET','history')[1]['records'][0]['status'],'correct')
     def test_probe_ticket_cookie_and_no_secret_persistence(self):
         status,result=self.run_request('fixture-probe','probe'); self.assertEqual(status,200); self.assertEqual(result['record']['status'],'degraded')
         self.assertNotIn('x-codex-turn-state',self.host.http[0]); self.assertNotIn('cookie',self.host.http[0])
@@ -140,8 +149,8 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(self.host.http),1)
     def test_custom_bank_compare_and_swap(self):
         q={'id':'custom_sum','title':'加法','category':'数学','prompt':'17+28，只输出整数','answer':'45'}
-        self.assertEqual(self.host.call('POST','/questions',{'questions':[q],'expected_version':None})[0],200)
-        self.assertEqual(self.host.call('POST','/questions',{'questions':[q],'expected_version':None})[0],409)
-        self.assertEqual(len(self.host.call('GET','/catalog')[1]['questions']),11)
+        self.assertEqual(self.host.call('POST','questions',{'questions':[q],'expected_version':None})[0],200)
+        self.assertEqual(self.host.call('POST','questions',{'questions':[q],'expected_version':None})[0],409)
+        self.assertEqual(len(self.host.call('GET','catalog')[1]['questions']),11)
 
 if __name__=='__main__': unittest.main(verbosity=2)
