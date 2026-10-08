@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { request, type Account, type Key } from './api'
+import { useModels } from './models'
 interface Settings { scheduled: boolean; auto_disable: boolean; interval_minutes: number; model: string; client_key_id: string | null; account_ids: string[] }
 interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string }
 interface Snapshot { state: { generation: string; settings: Settings; accounts: Record<string, Status>; last_tick_ms: number | null; last_error: string | null }; version: number | null }
 const props = defineProps<{ accounts: Account[]; keys: Key[] }>()
-const settings = ref<Settings>({ scheduled: false, auto_disable: false, interval_minutes: 30, model: 'gpt-6-astra', client_key_id: null, account_ids: [] })
+const settings = ref<Settings>({ scheduled: false, auto_disable: false, interval_minutes: 30, model: '', client_key_id: null, account_ids: [] })
+const { models, modelsLoading, modelsError, loadModels } = useModels(() => settings.value.client_key_id, computed({ get: () => settings.value.model, set: value => { settings.value.model = value } }))
 const snapshot = ref<Snapshot | null>(null), busy = ref(false), error = ref(''), notice = ref(''), filter = ref('')
 const candidates = computed(() => props.accounts.filter(a => a.provider === 'openai' && a.authentication_kind === 'oauth' && `${a.name} ${a.email || ''} ${a.id}`.toLowerCase().includes(filter.value.toLowerCase())))
 function time(value: number | null) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未执行' }
@@ -14,15 +16,16 @@ function statusLabel(status: string) { return ({ running: '结果未确认', ski
 function actionLabel(action: string) { return ({ pending: '停用待确认', disabled: '已自动停用', unconfirmed: '停用未确认' } as Record<string, string>)[action] || '无停用动作' }
 async function load() {
   busy.value = true; error.value = ''; notice.value = ''
-  try { snapshot.value = await request<Snapshot>('monitor'); settings.value = { ...snapshot.value.state.settings, account_ids: [...snapshot.value.state.settings.account_ids] } }
+  try { snapshot.value = await request<Snapshot>('monitor'); settings.value = { ...snapshot.value.state.settings, account_ids: [...snapshot.value.state.settings.account_ids] }; await loadModels() }
   catch (e) { error.value = (e as Error).message } finally { busy.value = false }
 }
 async function save() {
+  if (modelsLoading.value) { error.value = '模型目录正在加载，请稍后保存'; return }
   busy.value = true; error.value = ''; notice.value = ''
   try {
     snapshot.value = await request<Snapshot>('monitor', { settings: settings.value, expected_generation: snapshot.value?.state.generation || null })
     settings.value = { ...snapshot.value.state.settings, account_ids: [...snapshot.value.state.settings.account_ids] }
-    notice.value = '监控设置已保存；首轮按所设间隔执行，计数已重新开始'
+    notice.value = settings.value.scheduled ? '监控设置已保存，首轮按所设间隔执行，计数已重新开始' : settings.value.auto_disable ? '自动停用设置已保存，仅统计所选范围的手动探针' : '定时探针与自动停用已关闭，已发出的操作不撤回'
   } catch (e) { error.value = (e as Error).message } finally { busy.value = false }
 }
 onMounted(load)
@@ -36,7 +39,7 @@ onMounted(load)
     <div class="alert warning">自动停用仅在连续两轮探针均为“疑似降级”时执行。超时、限流、认证失败或无法判断不触发停用，且中断连续计数。账号不会自动恢复。</div>
     <fieldset :disabled="busy">
       <div class="inline monitor-toggles"><label class="choice"><input v-model="settings.scheduled" type="checkbox">启用定时探针</label><label class="choice"><input v-model="settings.auto_disable" type="checkbox">连续两轮疑似降级后自动停用账号</label></div>
-      <div class="form-grid"><label>监控客户端Key<select v-model="settings.client_key_id" aria-label="监控客户端Key"><option :value="null">请选择</option><option v-for="key in props.keys.filter(k => k.enabled)" :key="key.id" :value="key.id">{{ key.name || key.id }}</option></select></label><label>测试间隔（分钟）<input v-model.number="settings.interval_minutes" type="number" min="5" max="1440" step="1"></label><label>监控模型<input v-model="settings.model" maxlength="128"></label></div>
+      <div class="form-grid"><label>监控客户端Key<select v-model="settings.client_key_id" aria-label="监控客户端Key" @change="loadModels"><option :value="null">请选择</option><option v-for="key in props.keys.filter(k => k.enabled)" :key="key.id" :value="key.id">{{ key.name || key.id }}</option></select></label><label>测试间隔（分钟）<input v-model.number="settings.interval_minutes" type="number" min="5" max="1440" step="1"></label><label>监控模型<select v-model="settings.model" aria-label="监控模型" :disabled="modelsLoading || !models.length"><option v-if="!models.length" :value="modelsError ? settings.model : ''">{{ modelsLoading ? '正在加载可见模型' : modelsError ? settings.model || '模型加载失败' : settings.client_key_id ? '暂无可见模型' : '请先选择Key' }}</option><option v-for="name in models" :key="name" :value="name">{{ name }}</option></select><small v-if="modelsError" role="alert">模型加载失败 {{ modelsError }} <button class="text-button" type="button" @click="loadModels">重试</button></small><small v-else-if="settings.client_key_id && !modelsLoading && !models.length">所选Key暂无可见模型，请在宿主检查模型范围</small></label></div>
       <p class="muted">开关相互独立：自动停用也适用于所选账号、同一Key及模型的手动探针。题目测试不参与停用判定。</p>
       <div class="selection-header"><strong>监控账号 <span class="muted">已选 {{ settings.account_ids.length }} / 50</span></strong><div class="inline"><input v-model="filter" aria-label="筛选监控账号" placeholder="搜索名称、邮箱"><button type="button" @click="settings.account_ids = candidates.filter(a => a.enabled && a.proxy_configured).slice(0, 50).map(a => a.id)">选择筛选结果</button><button type="button" @click="settings.account_ids = []">取消选择</button></div></div>
       <div class="account-list"><label v-for="account in candidates" :key="account.id" class="choice"><input v-model="settings.account_ids" type="checkbox" :value="account.id" :disabled="(!account.enabled || !account.proxy_configured) && !settings.account_ids.includes(account.id)"><span>{{ account.name }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.enabled ? (account.proxy_configured ? 'OpenAI OAuth · 账号代理已配置' : '未配置账号代理') : '已停用，将跳过' }}</small></span></label><p v-if="!candidates.length" class="empty">暂无匹配的OpenAI OAuth账号</p></div>

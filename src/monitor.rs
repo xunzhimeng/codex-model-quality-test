@@ -26,7 +26,7 @@ impl Default for Settings {
             scheduled: false,
             auto_disable: false,
             interval_minutes: 30,
-            model: "gpt-6-astra".into(),
+            model: String::new(),
             client_key_id: None,
             account_ids: vec![],
         }
@@ -37,7 +37,7 @@ impl Settings {
         if !(5..=1440).contains(&self.interval_minutes) {
             return Err("间隔须为5至1440分钟".into());
         }
-        if self.model.is_empty()
+        if ((self.scheduled || self.auto_disable) && self.model.is_empty())
             || self.model.trim() != self.model
             || self.model.len() > 128
             || self.model.bytes().any(|b| b.is_ascii_control())
@@ -372,6 +372,8 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.account_ids = vec!["account".into()];
         settings.client_key_id = Some("key".into());
+        assert!(settings.validate().is_err());
+        settings.model = "visible-model".into();
         assert!(settings.validate().is_ok());
         settings.interval_minutes = 0;
         assert!(settings.validate().is_err());

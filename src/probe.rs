@@ -267,12 +267,30 @@ async fn read_shot(response: &mut reqwest::Response, round: &mut Round) -> Resul
     round.ticket_length = out.ticket.len();
     round.routing_cookie_count = out.cookies.len();
     if response.status().as_u16() != 200 {
-        return Err(match response.status().as_u16() {
-            401 | 403 => "上游拒绝认证，请核对令牌与账号权限",
-            429 => "上游限流或额度不足，无法判断",
-            _ => "上游未成功响应，无法判断",
+        let status = response.status().as_u16();
+        // 错误正文只在内存识别已知原因，不持久化上游原文，避免回显敏感内容。
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| format!("上游拒绝探针请求（HTTP {status}），错误正文读取失败"))?
+        {
+            if body.len() + chunk.len() > 8192 {
+                return Err(format!(
+                    "上游拒绝探针请求（HTTP {status}），错误正文超过上限"
+                ));
+            }
+            body.extend(chunk);
+            round.response_bytes = body.len();
         }
-        .into());
+        let reason = rejection_reason(&body).unwrap_or(match status {
+            401 | 403 => "认证或账号权限被拒绝，请在宿主核对账号",
+            429 => "上游限流或额度不足",
+            400 => "请求被拒绝，未识别具体原因，请核对上游模型及请求参数",
+            300..=399 => "上游要求重定向，探针禁止跟随",
+            _ => "上游未成功响应",
+        });
+        return Err(format!("{reason}（HTTP {status}），无法判断"));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -290,6 +308,53 @@ async fn read_shot(response: &mut reqwest::Response, round: &mut Round) -> Resul
     round.completed = true;
     round.reported_model = out.model.clone();
     Ok(out)
+}
+
+fn rejection_reason(body: &[u8]) -> Option<&'static str> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let code = value
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let param = value
+        .pointer("/error/param")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // 结构化字段比文案关键词可靠，参数错误的说明也可能包含“this model”。
+    if matches!(code, "unsupported_parameter" | "unsupported_value")
+        || matches!(
+            param,
+            "parallel_tool_calls" | "reasoning.effort" | "include"
+        )
+    {
+        Some("上游不支持探针请求中的参数")
+    } else if matches!(code, "invalid_api_key" | "token_expired" | "invalid_token") {
+        Some("访问令牌无效或已过期，请先在宿主刷新账号")
+    } else if matches!(code, "rate_limit_exceeded" | "insufficient_quota") {
+        Some("上游限流或额度不足")
+    } else if matches!(
+        code,
+        "model_not_found" | "unsupported_model" | "model_not_supported"
+    ) || (message.contains("model")
+        && [
+            "not supported",
+            "not available",
+            "does not exist",
+            "not found",
+            "do not have access",
+        ]
+        .iter()
+        .any(|text| message.contains(text)))
+    {
+        Some("上游不支持该模型或账号无权使用，请选择该OAuth账号可用的上游模型")
+    } else {
+        None
+    }
 }
 
 pub fn parse_completion(body: &[u8]) -> Result<Option<String>, String> {
@@ -346,6 +411,25 @@ pub fn parse_completion(body: &[u8]) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn structured_rejection_takes_priority_over_model_wording() {
+        for (code, param, expected) in [
+            (
+                "unsupported_parameter",
+                "parallel_tool_calls",
+                "上游不支持探针请求中的参数",
+            ),
+            (
+                "unsupported_value",
+                "reasoning.effort",
+                "上游不支持探针请求中的参数",
+            ),
+            ("rate_limit_exceeded", "", "上游限流或额度不足"),
+        ] {
+            let body = serde_json::to_vec(&json!({"error":{"code":code,"param":param,"message":"not supported for this model"}})).unwrap();
+            assert_eq!(rejection_reason(&body), Some(expected));
+        }
+    }
     #[test]
     fn ticket_verdict() {
         assert!(new_ticket("a", "b"));

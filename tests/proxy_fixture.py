@@ -69,7 +69,8 @@ class ProxyFixture:
                         if owner.on_stream:owner.on_stream()
                         if owner.stall_stream:
                             fixture.stop.wait(28);return
-                        if owner.bad_stream:body=b'data: {"type":"response.failed"}\n\n'
+                        if owner.http_status != 200: body=json.dumps(owner.error_body or {'error':{'code':'fixture_rejected','message':'fixture refusal'}}).encode()
+                        elif owner.bad_stream:body=b'data: {"type":"response.failed"}\n\n'
                         else:body=b'data: {"type":"response.completed","response":{"status":"completed","model":"fixture-model"}}\n\n'
                         ticket='ticket-first' if 'x-codex-turn-state' not in headers else owner.ticket_second
                         response=f'HTTP/1.1 {owner.http_status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {len(body)}\r\nx-codex-turn-state: {ticket}\r\nSet-Cookie: __oailb=route-fixture; Secure; HttpOnly\r\nSet-Cookie: other=not-forwarded; Secure\r\nConnection: close\r\n\r\n'.encode()+body

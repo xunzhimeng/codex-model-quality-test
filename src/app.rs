@@ -55,14 +55,14 @@ impl Drop for AccountGuard {
     }
 }
 
-// 取消本地等待不等于上游取消完成，未完成调用继续保留账号与并发槽的隔离窗口。
+// 宿主模型调用取消后保留隔离窗口，插件自有探针future结束或取消时连接已释放。
 struct PendingAccount {
     guard: Option<(AccountGuard, tokio::sync::OwnedSemaphorePermit)>,
-    completed: bool,
+    quarantine: bool,
 }
 impl Drop for PendingAccount {
     fn drop(&mut self) {
-        if !self.completed
+        if self.quarantine
             && let Some(guard) = self.guard.take()
         {
             tokio::spawn(async move {
@@ -400,6 +400,7 @@ impl App {
             }
             if history.records.iter().any(|r| {
                 r.account_id == request.account_id
+                    && r.mode == "question"
                     && r.status == "running"
                     && started.saturating_sub(r.started_at_ms) < 150_000
             }) {
@@ -410,7 +411,7 @@ impl App {
         }
         let mut pending = PendingAccount {
             guard: Some((_account, _slot)),
-            completed: false,
+            quarantine: request.mode == "question",
         };
         let outcome = if let Some(q) = question {
             tokio::time::timeout(
@@ -429,7 +430,7 @@ impl App {
             .await;
             Ok((r.status, None, r.detail, r.metrics))
         };
-        pending.completed = matches!(&outcome,Ok((status,_,_,_)) if status!="inconclusive");
+        pending.quarantine = request.mode == "question" && outcome.is_err();
         let mut record = record;
         record.finished_at_ms = Some(now_ms());
         record.latency_ms = Some(now_ms().saturating_sub(started));

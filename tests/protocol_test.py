@@ -51,6 +51,7 @@ class Host:
         self.disable_count = 0
         self.dispatch_status = 200
         self.http_status = 200
+        self.error_body = None
         self.fail_disable = False
         self.body_streams = {}
         self.on_stream = None
@@ -157,6 +158,9 @@ class Host:
         while True:
             msg,payload=self.messages.get(timeout=35)
             if msg['type']=='cancel': continue
+            if msg['type']=='cancelled':
+                assert msg['id']==id,msg
+                return 'cancelled',{}
             if msg['type']=='callback': self.callback(msg,payload); continue
             assert msg['type']=='result', msg
             assert msg['id']==id, msg
@@ -231,6 +235,10 @@ class Integration(unittest.TestCase):
         self.assertEqual(record['status'],'inconclusive');self.assertGreaterEqual(record['metrics']['rounds'][0]['elapsed_ms'],17000)
         self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
         self.assertEqual(self.host.disable_count,0)
+        self.host.stall_stream=False
+        status,result=self.run_request('fixture-after-timeout','probe')
+        self.assertEqual(status,200,result)
+        self.assertEqual(result['record']['status'],'degraded')
     def test_monitor_defaults_do_not_probe(self):
         self.assertEqual(self.host.call('plugin.reconcile',stage='maintenance'),{})
         self.assertEqual(len(self.host.http),0)
@@ -332,6 +340,59 @@ class Integration(unittest.TestCase):
         self.host.bad_stream=True
         self.assertEqual(self.run_request('fixture-failed','probe')[1]['record']['status'],'inconclusive')
         self.assertEqual(len(self.host.http),1)
+    def test_parent_cancel_releases_probe_account_without_replay(self):
+        # 在上游请求已抵达本机代理时取消真实父调用，不能用改写历史代替取消验证。
+        self.host.stall_stream=True
+        call_id=self.host.next_id
+        def cancel_parent():
+            self.host.write({'type':'cancel','id':call_id})
+        self.host.on_stream=cancel_parent
+        self.assertEqual(self.run_request('fixture-parent-cancel','probe')[0],'cancelled')
+        self.host.on_stream=None;self.host.stall_stream=False
+        self.assertEqual(self.run_request('fixture-after-parent-cancel','probe')[0],200)
+        self.assertEqual(self.host.proxy.connects,3)
+        prior=self.host.states['history']['value']['records'][0]
+        self.assertEqual(prior['status'],'running')
+        self.assertTrue(self.run_request('fixture-parent-cancel','probe')[1]['replayed'])
+        self.assertEqual(self.host.proxy.connects,3)
+    def test_rejection_reason_is_classified_without_echoing_secrets(self):
+        self.host.http_status=400
+        self.host.error_body={'error':{'code':'model_not_found','message':'fixture-token-not-real model does not exist'}}
+        r=self.run_request('fixture-model-rejected','probe')[1]['record']
+        self.assertIn('上游不支持该模型',r['detail']);self.assertGreater(r['metrics']['rounds'][0]['response_bytes'],0)
+        self.assertNotIn('fixture-token-not-real',dump(r).decode())
+        self.host.error_body={'error':{'code':'unsupported_parameter','param':'parallel_tool_calls','message':'secret fixture-password'}}
+        r=self.run_request('fixture-param-rejected','probe')[1]['record']
+        self.assertIn('上游不支持探针请求中的参数',r['detail'])
+        self.assertNotIn('fixture-password',dump(self.host.states).decode())
+    def test_rejected_probe_releases_account_for_next_operation(self):
+        self.host.http_status=400
+        first=self.run_request('fixture-rejected-1','probe')[1]['record']
+        self.assertEqual(first['status'],'inconclusive')
+        self.assertIn('HTTP 400',first['detail'])
+        status,replayed=self.run_request('fixture-rejected-1','probe')
+        self.assertEqual(status,200);self.assertTrue(replayed['replayed'])
+        self.assertEqual(self.host.proxy.connects,1)
+        self.host.http_status=200
+        status,result=self.run_request('fixture-after-rejected','probe')
+        self.assertEqual(status,200,result)
+        self.assertEqual(result['record']['status'],'degraded')
+        self.assertEqual(self.host.proxy.connects,3)
+    def test_failed_stream_releases_account_for_next_operation(self):
+        self.host.bad_stream=True
+        self.assertEqual(self.run_request('fixture-stream-failed','probe')[1]['record']['status'],'inconclusive')
+        self.host.bad_stream=False
+        self.assertEqual(self.run_request('fixture-after-stream','probe')[1]['record']['status'],'degraded')
+    def test_uncertain_host_question_still_keeps_isolation(self):
+        self.run_request('fixture-prior-question')
+        prior=self.host.states['history']['value']['records'][-1]
+        prior['status']='running';prior['finished_at_ms']=None
+        self.assertEqual(self.run_request('fixture-after-question','probe')[0],400)
+    def test_interrupted_local_probe_history_does_not_block_new_operation(self):
+        self.run_request('fixture-prior-probe','probe')
+        prior=self.host.states['history']['value']['records'][-1]
+        prior['status']='running';prior['finished_at_ms']=None
+        self.assertEqual(self.run_request('fixture-after-interrupted','probe')[0],200)
     def test_custom_bank_compare_and_swap(self):
         q={'id':'custom_sum','title':'加法','category':'数学','prompt':'17+28，只输出整数','answer':'45'}
         self.assertEqual(self.host.call('POST','questions',{'questions':[q],'expected_version':None})[0],200)

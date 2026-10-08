@@ -2,12 +2,14 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { request, type Account, type Catalog, type History, type Question, type TestRecord } from './api'
 import { csvCell, runAccountQueue } from './queue'
+import { useModels } from './models'
 import MonitorPanel from './MonitorPanel.vue'
 import ProbeDetails from './ProbeDetails.vue'
 const catalog = ref<Catalog>({ accounts: [], keys: [], questions: [], bank_version: null, version: '' })
 const records = ref<TestRecord[]>([]), evicted = ref(0), error = ref(''), notice = ref(''), loading = ref(false)
 const tab = ref('new'), mode = ref('question'), accountFilter = ref(''), selectedAccounts = ref<string[]>([]), selectedQuestions = ref<string[]>([])
-const key = ref(''), model = ref(''), effort = ref('medium'), concurrency = ref(2), models = ref<string[]>([]), modelsLoading = ref(false)
+const key = ref(''), model = ref(''), effort = ref('medium'), concurrency = ref(2)
+const { models, modelsLoading, modelsError, loadModels } = useModels(() => key.value, model)
 const running = ref(false), stopping = ref(false), completed = ref(0), total = ref(0), batchId = ref(''), current = ref<TestRecord | null>(null)
 const customJson = ref(''), bankSaving = ref(false)
 const dialog = ref<HTMLElement | null>(null)
@@ -54,18 +56,6 @@ async function reload() {
     if (!catalog.value.keys.some(k => k.id === key.value && k.enabled)) key.value = catalog.value.keys.find(k => k.enabled)?.id || ''
     await refreshHistory(); await loadModels()
   } catch (e) { error.value = (e as Error).message } finally { loading.value = false }
-}
-let modelLoad = 0
-async function loadModels() {
-  const version = ++modelLoad; models.value = []
-  if (!key.value) return
-  modelsLoading.value = true
-  try {
-    const result = await request<{ models: string[] }>('models', { client_key_id: key.value })
-    if (version !== modelLoad) return
-    models.value = result.models
-    if (!models.value.includes(model.value)) model.value = models.value.includes('gpt-6-astra') ? 'gpt-6-astra' : models.value[0] || ''
-  } catch (e) { if (version === modelLoad) error.value = (e as Error).message } finally { if (version === modelLoad) modelsLoading.value = false }
 }
 function changeMode() { selectedAccounts.value = selectedAccounts.value.filter(id => catalog.value.accounts.some(a => a.id === id && (mode.value !== 'probe' || (a.probe_supported && a.proxy_configured)))) }
 function selectAccounts() { selectedAccounts.value = visibleAccounts.value.filter(a => a.enabled && (mode.value !== 'probe' || (a.probe_supported && a.proxy_configured))).map(a => a.id) }
@@ -134,13 +124,13 @@ onMounted(reload)
         <div class="section-head"><nav class="segments" aria-label="测试类型"><button :class="{ active: mode === 'question' }" :disabled="running" @click="mode = 'question'">题目测试</button><button :class="{ active: mode === 'probe' }" :disabled="running" @click="mode = 'probe'; changeMode()">探针测试</button></nav>
           <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>账号未配置代理或代理失败时停止，不回退直连；令牌须在宿主刷新<br>Key仅限定范围，不经过Key计费／额度／租约链，探针模型使用实际上游名称且须在Key可见范围<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链</template></div></details>
         </div>
-        <div v-if="mode === 'probe'" class="alert warning">探针按所选Key校验账号与模型范围，强制使用账号代理；不计入Key账单 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
+        <div v-if="mode === 'probe'" class="alert warning">探针按所选Key限定账号与模型范围，强制使用账号代理，不计入Key账单 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
         <fieldset :disabled="running || loading">
           <div class="form-grid">
             <label>客户端Key<select v-model="key" aria-label="客户端Key" @change="loadModels"><option value="">请选择</option><option v-for="k in catalog.keys.filter(k => k.enabled)" :key="k.id" :value="k.id">{{ k.name || k.id }}</option></select></label>
-            <label>模型<input v-model="model" list="model-options" maxlength="128" :placeholder="modelsLoading ? '正在加载可见模型' : '请选择或输入模型'"><datalist id="model-options"><option v-for="name in models" :key="name" :value="name" /></datalist></label>
+            <label>模型<select v-model="model" aria-label="模型" :disabled="modelsLoading || !models.length"><option v-if="!models.length" :value="modelsError ? model : ''">{{ modelsLoading ? '正在加载可见模型' : modelsError ? model || '模型加载失败' : key ? '暂无可见模型' : '请先选择Key' }}</option><option v-for="name in models" :key="name" :value="name">{{ name }}</option></select><small v-if="modelsError" role="alert">模型加载失败 {{ modelsError }} <button class="text-button" type="button" @click="loadModels">重试</button></small><small v-else-if="key && !modelsLoading && !models.length">所选Key暂无可见模型，请在宿主检查模型范围</small></label>
             <label v-if="mode === 'question'">思考强度<select v-model="effort"><option value="default">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option></select></label>
-            <label>账号并发数<select v-model="concurrency"><option v-for="n in 4" :key="n" :value="n">{{ n }}</option></select></label>
+            <label>同时测试账号数<select v-model="concurrency"><option v-for="n in 4" :key="n" :value="n">{{ n }}</option></select><small>不同账号可并行，同一账号始终串行，只选1个账号时不影响速度</small></label>
           </div>
           <div class="selection-header"><strong>账号 <span class="muted">已选 {{ selectedAccounts.length }}</span></strong><div class="inline"><input v-model="accountFilter" aria-label="筛选账号" placeholder="搜索账号"><button type="button" @click="selectAccounts">选择筛选结果</button><button type="button" @click="selectedAccounts = []">取消选择</button></div></div>
           <div class="account-list"><label v-for="account in visibleAccounts" :key="account.id" class="choice"><input v-model="selectedAccounts" type="checkbox" :value="account.id" :disabled="!account.enabled || (mode === 'probe' && (!account.probe_supported || !account.proxy_configured))"><span>{{ account.name || account.id }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.provider }} · {{ account.authentication_kind }}{{ !account.enabled ? ' · 已停用' : mode === 'probe' && !account.probe_supported ? ' · 不适用或令牌过期' : mode === 'probe' && !account.proxy_configured ? ' · 未配置代理' : '' }}</small></span></label><p v-if="!visibleAccounts.length" class="empty">暂无匹配账号</p></div>
