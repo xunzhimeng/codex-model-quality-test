@@ -16,6 +16,30 @@ pub struct AccountInfo {
     pub email: Option<String>,
     pub notes: Option<String>,
     pub enabled: bool,
+    pub groups: Vec<GroupRef>,
+    #[serde(rename = "modelAccess")]
+    pub model_access: ModelAccess,
+    #[serde(rename = "outboundProxyEndpoint")]
+    pub proxy_endpoint: Option<String>,
+}
+#[derive(Deserialize)]
+pub struct GroupRef {
+    pub id: String,
+}
+#[derive(Deserialize)]
+pub struct ModelAccess {
+    mode: String,
+    models: Vec<String>,
+}
+impl ModelAccess {
+    pub fn allows(&self, model: &str) -> Result<bool, String> {
+        match self.mode.as_str() {
+            "all" if self.models.is_empty() => Ok(true),
+            "allowlist" => Ok(self.models.iter().any(|m| m == model)),
+            "denylist" => Ok(!self.models.iter().any(|m| m == model)),
+            _ => Err("账号模型政策格式无效".into()),
+        }
+    }
 }
 #[derive(Deserialize)]
 struct Page {
@@ -190,6 +214,12 @@ mod tests {
             email: account.email.clone(),
             notes: Some("主力账号".into()),
             enabled: true,
+            groups: vec![],
+            model_access: ModelAccess {
+                mode: "all".into(),
+                models: vec![],
+            },
+            proxy_endpoint: None,
         };
         assert_eq!(label(&account, &info), "主力账号");
         info.notes = None;

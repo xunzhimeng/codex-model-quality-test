@@ -1,7 +1,9 @@
 mod accounts;
 mod app;
+mod key_scope;
 mod monitor;
 mod probe;
+mod proxy_transport;
 mod questions;
 mod store;
 

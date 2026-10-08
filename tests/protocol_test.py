@@ -8,6 +8,9 @@ import subprocess
 import threading
 import time
 import unittest
+import sys
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
+from proxy_fixture import ProxyFixture
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -24,12 +27,22 @@ def events(answer='21'):
 
 class Host:
     def __init__(self):
-        self.process = subprocess.Popen([str(ROOT/'target/debug'/('model-quality-test.exe' if os.name=='nt' else 'model-quality-test'))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proxy=ProxyFixture(self)
+        self.proxy_url=self.proxy.url
+        self.key_enabled=True
+        self.key_groups=[]
+        self.group_enabled=True
+        self.model_visible=True
+        self.proxy_configured=True
+        self.export_id='fixture-account'
+        self.export_count=0
+        self.model_policy={'mode':'all','models':[]}
+        self.process = subprocess.Popen([str(ROOT/'target/debug'/('model-quality-test.exe' if os.name=='nt' else 'model-quality-test'))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,env={**os.environ,'SSL_CERT_FILE':str(self.proxy.ca_path)})
         self.messages = queue.Queue()
         self.states = {}
         self.calls = []
         self.streams = {}
-        self.http = []
+        self.http = self.proxy.requests
         self.ticket_second = 'ticket-new'
         self.bad_stream = False
         self.model_count = 0
@@ -73,13 +86,16 @@ class Host:
             assert params=={}; request=json.loads(body)
             if method=='host.auth.list': payload=dump({'accounts':[account],'next_cursor':None})
             elif method=='host.auth.get_runtime': payload=dump(account)
-            elif method=='host.auth.get': payload=dump({'account_id':'fixture-account','provider_id':'openai','credential_revision':1,'facts':{'name':'测试账号','authentication_kind':'oauth','material':{'access_token':'fixture-token-not-real'},'email':None,'upstream_user_id':None,'upstream_account_id':'fixture-upstream','plan_type':'plus','has_refresh_token':False,'access_token_expires_at_ms':None,'next_refresh_at_ms':None}})
+            else:raise AssertionError('unexpected credential read '+method)
+        elif method=='host.data.keys.get':
+            assert params=={} and json.loads(body)=={'client_key_id':'fixture-key'}
+            payload=dump({'schema_version':1,'client_key_id':'fixture-key','enabled':self.key_enabled,'group_ids':self.key_groups})
         elif method=='host.keys.list':
             assert not body; assert params['limit']==100
             result={'keys':[{'id':'fixture-key','name':'测试Key','enabled':True}],'next_cursor':None}
         elif method=='host.models.list':
             assert not body; assert params['client_key_id']=='fixture-key'
-            result={'models':['fixture-model']}
+            result={'models':['fixture-model'] if self.model_visible else []}
         elif method=='host.state.get':
             assert not body; assert params['namespace']=='quality'
             result={'record':self.states.get(params['key'])}
@@ -103,7 +119,15 @@ class Host:
             if uri.path=='/api/admin/accounts':
                 assert params['method']=='GET' and not body
                 assert set(parse_qs(uri.query))=={'page','pageSize'}
-                data={'items':[{'id':'fixture-account','name':'OpenAI 账号','email':'fixture@example.test','notes':self.account_notes,'enabled':self.account_enabled}], 'page':{'totalPages':1}}
+                data={'items':[{'id':'fixture-account','name':'OpenAI 账号','email':'fixture@example.test','notes':self.account_notes,'enabled':self.account_enabled,'groups':[{'id':'fixture-group'}],'modelAccess':self.model_policy,'outboundProxyEndpoint':'http://127.0.0.1' if self.proxy_configured else None}], 'page':{'totalPages':1}}
+            elif uri.path=='/api/admin/account-groups':
+                assert set(parse_qs(uri.query))=={'page','pageSize'}
+                data={'items':[{'id':'fixture-group','enabled':self.group_enabled}],'page':{'totalPages':1}}
+            elif uri.path=='/api/admin/accounts/export':
+                assert parse_qs(uri.query)=={'accountIds':['fixture-account'],'confirm':['export_sensitive_accounts']}
+                assert params['method']=='GET' and not body
+                self.export_count+=1
+                data={'documents':[{'provider':'openai','document':{'accounts':[{'id':self.export_id,'accessToken':'fixture-token-not-real','accountId':'fixture-upstream','outboundProxyUrl':self.proxy_url}]}}]}
             elif uri.path=='/api/admin/accounts/batch-update':
                 assert params['method']=='POST'
                 assert json.loads(body)=={'accountIds':['fixture-account'],'enabled':False}
@@ -121,24 +145,7 @@ class Host:
             result={'eof':data is None,'trailers':None}; payload=data or b''
             self.body_streams[params['handle']]=None
         elif method=='host.http.body_close': result={}
-        elif method=='host.http.do_stream':
-            assert params['url']=='https://chatgpt.com/backend-api/codex/responses'
-            assert json.loads(body)['stream'] is True
-            headers=dict(params['headers']); self.http.append(headers)
-            number=len(self.http); stream=f'stream-{number}'
-            ticket='ticket-first' if number%2 else self.ticket_second
-            response_headers=[['x-codex-turn-state',ticket],['set-cookie','__oailb=route-fixture; Secure; HttpOnly'],['set-cookie','other=not-forwarded; Secure']]
-            self.streams[stream]=0
-            if self.on_stream: self.on_stream()
-            if self.stall_stream: return
-            result={'status':self.http_status,'headers':response_headers,'stream':stream}
-        elif method=='host.http.stream_read':
-            stream=params['stream']; number=self.streams[stream]; self.streams[stream]+=1
-            if number==0:
-                payload=(b'data: {"type":"response.failed"}\n\n' if self.bad_stream else b'data: {"type":"response.completed","response":{"status":"completed","model":"fixture-model"}}\n\n')
-                result={'eof':False}
-            else: result={'eof':True}
-        elif method=='host.http.stream_close': result={}
+
         else: raise AssertionError('unexpected callback '+method)
         self.write({'type':'result','id':msg['id'],'result':result},payload)
     def call(self, method, path=None, body=None, stage='management'):
@@ -160,20 +167,61 @@ class Host:
         self.write({'type':'shutdown'}); self.process.wait(timeout=5)
         assert self.process.returncode==0,self.process.stderr.read().decode()
         self.process.stdin.close(); self.process.stdout.close(); self.process.stderr.close()
+        self.proxy.close()
+        assert not self.proxy.errors,self.proxy.errors
 
 class Integration(unittest.TestCase):
     def setUp(self): self.host=Host()
     def tearDown(self): self.host.close()
     def run_request(self,id,mode='question'):
-        return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':'fixture-model','effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key' if mode=='question' else None,'question_id':'candy' if mode=='question' else None})
+        return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':'fixture-model','effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key','question_id':'candy' if mode=='question' else None})
     def configure_monitor(self,scheduled=True,auto_disable=True):
         snapshot=self.host.call('GET','monitor')[1]
-        status,result=self.host.call('POST','monitor',{'settings':{'scheduled':scheduled,'auto_disable':auto_disable,'interval_minutes':30,'model':'fixture-model','account_ids':['fixture-account']},'expected_generation':snapshot['state']['generation'] or None})
+        status,result=self.host.call('POST','monitor',{'settings':{'scheduled':scheduled,'auto_disable':auto_disable,'interval_minutes':30,'model':'fixture-model','client_key_id':'fixture-key','account_ids':['fixture-account']},'expected_generation':snapshot['state']['generation'] or None})
         self.assertEqual(status,200,result)
         return result
     def due(self):
         state=self.host.states['monitor']['value']
         state['accounts']['fixture-account']['next_due_ms']=0
+    def test_key_and_scope_failures_do_not_export_credentials(self):
+        for field,value in [('key_enabled',False),('model_visible',False),('key_groups',['other-group'])]:
+            with self.subTest(field=field):
+                original=getattr(self.host,field);setattr(self.host,field,value)
+                status,_=self.run_request('fixture-scope-'+field,'probe')
+                self.assertEqual(status,400);self.assertEqual(self.host.export_count,0);self.assertEqual(self.host.proxy.connects,0)
+                setattr(self.host,field,original)
+        self.host.key_groups=['fixture-group'];self.host.group_enabled=False
+        status,_=self.run_request('fixture-disabled-group','probe');self.assertEqual(status,400);self.assertEqual(self.host.export_count,0)
+    def test_missing_proxy_and_export_mismatch_stop_before_network(self):
+        self.host.proxy_configured=False
+        status,_=self.run_request('fixture-no-proxy','probe');self.assertEqual(status,400);self.assertEqual(self.host.export_count,0)
+        self.host.proxy_configured=True;self.host.proxy_url=None
+        result=self.run_request('fixture-empty-export-proxy','probe')[1]['record']
+        self.assertEqual(result['status'],'inconclusive');self.assertIn('禁止直连',result['detail']);self.assertEqual(self.host.proxy.connects,0)
+    def test_export_only_selected_id_and_rejects_mismatch(self):
+        self.host.export_id='other-account'
+        r=self.run_request('fixture-export-mismatch','probe')[1]['record']
+        self.assertEqual(r['status'],'inconclusive');self.assertEqual(self.host.proxy.connects,0)
+    def test_old_monitor_pauses_and_resets_before_any_probe(self):
+        config=self.configure_monitor()
+        state=self.host.states['monitor']['value'];state.pop('probe_version');state['settings'].pop('client_key_id')
+        state['accounts']['fixture-account']['streak']=1;state['accounts']['fixture-account']['next_due_ms']=0
+        self.host.call('plugin.reconcile',stage='maintenance')
+        snapshot=self.host.call('GET','monitor')[1]['state']
+        self.assertFalse(snapshot['settings']['scheduled']);self.assertFalse(snapshot['settings']['auto_disable'])
+        self.assertIsNone(snapshot['settings']['client_key_id']);self.assertEqual(snapshot['accounts']['fixture-account']['streak'],0)
+        self.assertEqual(self.host.export_count,0);self.assertEqual(len(self.host.http),0)
+        self.assertEqual(snapshot['generation'],self.host.call('GET','monitor')[1]['state']['generation'])
+    def test_proxy_redirect_is_not_followed(self):
+        self.host.http_status=302
+        r=self.run_request('fixture-proxy-redirect','probe')[1]['record']
+        self.assertEqual(r['status'],'inconclusive');self.assertEqual(self.host.proxy.connects,1)
+    def test_account_model_policy_is_enforced(self):
+        self.host.model_policy={'mode':'denylist','models':['fixture-model']}
+        self.assertEqual(self.run_request('fixture-account-model','probe')[0],400);self.assertEqual(self.host.export_count,0)
+    def test_probe_missing_key_is_rejected(self):
+        status,_=self.host.call('POST','run',{'id':'fixture-missing-key','batch_id':'fixture-batch','account_id':'fixture-account','mode':'probe','model':'fixture-model','effort':'default','client_key_id':None,'question_id':None})
+        self.assertEqual(status,400);self.assertEqual(self.host.export_count,0)
     def test_background_timeout_preserves_details_without_disabling(self):
         self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
         self.host.stall_stream=True;self.due();started=time.monotonic()
@@ -277,7 +325,9 @@ class Integration(unittest.TestCase):
         status,result=self.run_request('fixture-probe','probe'); self.assertEqual(status,200); self.assertEqual(result['record']['status'],'degraded')
         self.assertNotIn('x-codex-turn-state',self.host.http[0]); self.assertNotIn('cookie',self.host.http[0])
         self.assertEqual(self.host.http[1]['x-codex-turn-state'],'ticket-first'); self.assertEqual(self.host.http[1]['cookie'],'__oailb=route-fixture')
-        state=dump(self.host.states).decode(); self.assertNotIn('ticket-first',state);self.assertNotIn('fixture-token-not-real',state);self.assertNotIn('route-fixture',state);self.assertNotIn('fixture-admin-not-real',state)
+        state=dump(self.host.states).decode(); self.assertNotIn('ticket-first',state);self.assertNotIn('fixture-token-not-real',state);self.assertNotIn('route-fixture',state);self.assertNotIn('fixture-admin-not-real',state);self.assertNotIn('fixture-password',state);self.assertNotIn(self.host.proxy.url,state)
+        self.assertEqual(self.host.proxy.connects,2)
+        self.assertEqual(result['record']['metrics']['client_key_id'],'fixture-key');self.assertFalse(result['record']['metrics']['key_billed'])
     def test_failed_stream_is_inconclusive(self):
         self.host.bad_stream=True
         self.assertEqual(self.run_request('fixture-failed','probe')[1]['record']['status'],'inconclusive')

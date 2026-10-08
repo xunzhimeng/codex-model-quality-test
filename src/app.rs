@@ -1,5 +1,5 @@
 use crate::{
-    accounts, monitor, probe,
+    accounts, key_scope, monitor, probe,
     questions::{self, Question},
     store::{self, CustomBank, History, Record, metadata_call, now_ms, payload_call},
 };
@@ -115,6 +115,13 @@ impl RunRequest {
         if !matches!(self.mode.as_str(), "question" | "probe") {
             return Err("测试类型无效".into());
         }
+        if self
+            .client_key_id
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty() || s.len() > 128)
+        {
+            return Err("请选择客户端Key".into());
+        }
         if self.mode == "question"
             && (self
                 .client_key_id
@@ -127,12 +134,8 @@ impl RunRequest {
         {
             return Err("请选择客户端Key与题目".into());
         }
-        if self.mode == "probe"
-            && (self.question_id.is_some()
-                || self.client_key_id.is_some()
-                || self.effort != "default")
-        {
-            return Err("探针不接受题目、Key或思考强度".into());
+        if self.mode == "probe" && (self.question_id.is_some() || self.effort != "default") {
+            return Err("探针不接受题目或思考强度".into());
         }
         Ok(())
     }
@@ -185,7 +188,7 @@ impl App {
                     .await?;
                     for a in page.accounts {
                         let identity = info.get(&a.account_id).ok_or("账号目录已变化，请刷新")?;
-                        accounts.push(json!({"id":a.account_id,"name":accounts::label(&a,identity),"email":a.email,"provider":a.provider_id,"authentication_kind":a.authentication_kind,"enabled":a.enabled,"probe_supported":probe::eligibility(&a).is_ok()}));
+                        accounts.push(json!({"id":a.account_id,"name":accounts::label(&a,identity),"email":a.email,"provider":a.provider_id,"authentication_kind":a.authentication_kind,"enabled":a.enabled,"probe_supported":probe::eligibility(&a).is_ok(),"proxy_configured":identity.proxy_endpoint.as_ref().is_some_and(|s|!s.is_empty())}));
                     }
                     cursor = page.next_cursor;
                     if cursor.is_none() {
@@ -272,7 +275,12 @@ impl App {
                 request.validate()?;
                 let generation = if request.mode == "probe" {
                     self.monitor
-                        .generation(host, &request.account_id, &request.model)
+                        .generation(
+                            host,
+                            &request.account_id,
+                            &request.model,
+                            request.client_key_id.as_deref().unwrap_or_default(),
+                        )
                         .await?
                 } else {
                     None
@@ -291,6 +299,7 @@ impl App {
         monitor_generation: Option<String>,
         scheduled: bool,
     ) -> Result<Response, String> {
+        request.validate()?;
         let _slot = match self.slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => return Err("最多同时运行4个测试".into()),
@@ -346,6 +355,22 @@ impl App {
             None
         };
         let identity = accounts::get(host, &account.account_id).await?;
+        if request.mode == "probe" {
+            key_scope::check(
+                host,
+                request.client_key_id.as_deref().unwrap_or_default(),
+                &request.model,
+                &identity,
+            )
+            .await?;
+            if identity
+                .proxy_endpoint
+                .as_ref()
+                .is_none_or(|s| s.is_empty())
+            {
+                return Err("账号未配置代理，禁止直连探针".into());
+            }
+        }
         let started = now_ms();
         let record = Record {
             id: request.id.clone(),
@@ -365,7 +390,7 @@ impl App {
             latency_ms: None,
             answer: None,
             detail: "结果未确认，刷新后查看记录，不自动重试".into(),
-            metrics: json!({}),
+            metrics: json!({"client_key_id":request.client_key_id}),
         };
         {
             let _guard = self.history.lock().await;
@@ -425,6 +450,7 @@ impl App {
                 record.detail = error;
             }
         }
+        record.metrics["client_key_id"] = json!(request.client_key_id);
         record.metrics["source"] = json!(if scheduled { "scheduled" } else { "manual" });
         if let Some(generation) = monitor_generation
             && let Err(error) = self.monitor.observe(host, &mut record, &generation).await
@@ -559,10 +585,13 @@ mod tests {
             mode: "probe".into(),
             model: "test".into(),
             effort: "default".into(),
-            client_key_id: None,
+            client_key_id: Some("key".into()),
             question_id: None,
         };
         assert!(r.validate().is_ok());
+        r.client_key_id = None;
+        assert!(r.validate().is_err());
+        r.client_key_id = Some("key".into());
         r.effort = "unsafe".into();
         assert!(r.validate().is_err());
     }

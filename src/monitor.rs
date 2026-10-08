@@ -16,6 +16,8 @@ pub struct Settings {
     pub auto_disable: bool,
     pub interval_minutes: u32,
     pub model: String,
+    #[serde(default)]
+    pub client_key_id: Option<String>,
     pub account_ids: Vec<String>,
 }
 impl Default for Settings {
@@ -25,6 +27,7 @@ impl Default for Settings {
             auto_disable: false,
             interval_minutes: 30,
             model: "gpt-6-astra".into(),
+            client_key_id: None,
             account_ids: vec![],
         }
     }
@@ -40,6 +43,14 @@ impl Settings {
             || self.model.bytes().any(|b| b.is_ascii_control())
         {
             return Err("探针模型无效".into());
+        }
+        if (self.scheduled || self.auto_disable)
+            && self
+                .client_key_id
+                .as_ref()
+                .is_none_or(|id| id.trim().is_empty() || id.len() > 128)
+        {
+            return Err("启用监控须选择客户端Key".into());
         }
         if self.account_ids.len() > 50
             || ((self.scheduled || self.auto_disable) && self.account_ids.is_empty())
@@ -82,6 +93,8 @@ impl AccountState {
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    pub probe_version: u32,
     pub settings: Settings,
     pub generation: String,
     pub accounts: BTreeMap<String, AccountState>,
@@ -100,8 +113,28 @@ pub struct Monitor {
     lock: Mutex<()>,
 }
 impl Monitor {
+    // 出站路径与Key身份变更后旧结论不续算，也不能悄悄启用新的网络路径。
+    async fn load(&self, host: &HostClient) -> Result<(State, Option<u64>), String> {
+        let (mut state, version) = store::get::<State>(host, "monitor").await?;
+        if version.is_some() && state.probe_version == 0 {
+            state.probe_version = 1;
+            state.settings.scheduled = false;
+            state.settings.auto_disable = false;
+            state.generation = uuid::Uuid::new_v4().to_string();
+            for status in state.accounts.values_mut() {
+                status.streak = 0;
+                status.last_status = "".into();
+            }
+            state.last_error =
+                Some("探针已切换为Key范围校验和账号代理，请选择Key并重新保存启用计划".into());
+            store::put(host, "monitor", &state, version).await?;
+            return store::get::<State>(host, "monitor").await;
+        }
+        Ok((state, version))
+    }
     pub async fn snapshot(&self, host: &HostClient) -> Result<Value, String> {
-        let (state, version) = store::get::<State>(host, "monitor").await?;
+        let _guard = self.lock.lock().await;
+        let (state, version) = self.load(host).await?;
         Ok(json!({"state":state,"version":version}))
     }
     pub async fn save(&self, host: &HostClient, request: Save) -> Result<Value, String> {
@@ -117,13 +150,28 @@ impl Monitor {
                         },
                     )
                     .await?;
+                let info = accounts::get(host, id).await?;
+                crate::key_scope::check(
+                    host,
+                    request
+                        .settings
+                        .client_key_id
+                        .as_deref()
+                        .unwrap_or_default(),
+                    &request.settings.model,
+                    &info,
+                )
+                .await?;
+                if info.proxy_endpoint.as_ref().is_none_or(|s| s.is_empty()) {
+                    return Err("监控账号未配置代理".into());
+                }
                 if account.provider_id != "openai" || account.authentication_kind != "oauth" {
                     return Err("监控仅支持OpenAI OAuth账号".into());
                 }
             }
         }
         let _guard = self.lock.lock().await;
-        let (previous, version) = store::get::<State>(host, "monitor").await?;
+        let (previous, version) = self.load(host).await?;
         let current_generation =
             (!previous.generation.is_empty()).then_some(previous.generation.as_str());
         if current_generation != request.expected_generation.as_deref() {
@@ -131,6 +179,7 @@ impl Monitor {
         }
         let now = now_ms();
         let mut state = State {
+            probe_version: 1,
             settings: request.settings,
             generation: uuid::Uuid::new_v4().to_string(),
             ..State::default()
@@ -148,6 +197,7 @@ impl Monitor {
             state.accounts.insert(id.clone(), status);
         }
         store::put(host, "monitor", &state, version).await?;
+        drop(_guard);
         self.snapshot(host).await
     }
     pub async fn generation(
@@ -155,9 +205,12 @@ impl Monitor {
         host: &HostClient,
         account_id: &str,
         model: &str,
+        key: &str,
     ) -> Result<Option<String>, String> {
-        let (state, _) = store::get::<State>(host, "monitor").await?;
+        let _guard = self.lock.lock().await;
+        let (state, _) = self.load(host).await?;
         Ok((state.settings.auto_disable
+            && state.settings.client_key_id.as_deref() == Some(key)
             && state.settings.model == model
             && state.settings.account_ids.iter().any(|id| id == account_id))
         .then_some(state.generation))
@@ -169,7 +222,7 @@ impl Monitor {
         generation: &str,
     ) -> Result<bool, String> {
         let _guard = self.lock.lock().await;
-        let (mut state, version) = store::get::<State>(host, "monitor").await?;
+        let (mut state, version) = self.load(host).await?;
         if state.generation != generation {
             return Ok(false);
         }
@@ -190,8 +243,12 @@ impl Monitor {
         generation: &str,
     ) -> Result<(), String> {
         let _guard = self.lock.lock().await;
-        let (mut state, version) = store::get::<State>(host, "monitor").await?;
-        if state.generation != generation || state.settings.model != record.model {
+        let (mut state, version) = self.load(host).await?;
+        if state.generation != generation
+            || state.settings.model != record.model
+            || state.settings.client_key_id.as_deref()
+                != record.metrics.get("client_key_id").and_then(Value::as_str)
+        {
             return Ok(());
         }
         let Some(status) = state.accounts.get_mut(&record.account_id) else {
@@ -217,7 +274,7 @@ impl Monitor {
             return Ok(());
         }
         let result = accounts::disable(host, &record.account_id).await;
-        let (mut state, version) = store::get::<State>(host, "monitor").await?;
+        let (mut state, version) = self.load(host).await?;
         if state.generation != generation {
             return Err("停用后监控状态已变化，请核对账号".into());
         }
@@ -240,7 +297,7 @@ impl Monitor {
     pub async fn tick(&self, app: &App, host: &HostClient) -> Result<(), String> {
         let job = {
             let _guard = self.lock.lock().await;
-            let (mut state, version) = store::get::<State>(host, "monitor").await?;
+            let (mut state, version) = self.load(host).await?;
             if !state.settings.scheduled {
                 return Ok(());
             }
@@ -260,7 +317,12 @@ impl Monitor {
             // 先预约下一次到期；重启不补发旧任务，避免宿主重试维护回调产生重复消耗。
             state.accounts.get_mut(&id).unwrap().next_due_ms =
                 now + u64::from(state.settings.interval_minutes) * 60_000;
-            let job = (id, state.settings.model.clone(), state.generation.clone());
+            let job = (
+                id,
+                state.settings.model.clone(),
+                state.generation.clone(),
+                state.settings.client_key_id.clone(),
+            );
             store::put(host, "monitor", &state, version).await?;
             job
         };
@@ -271,13 +333,13 @@ impl Monitor {
             mode: "probe".into(),
             model: job.1,
             effort: "default".into(),
-            client_key_id: None,
+            client_key_id: job.3,
             question_id: None,
         };
         // maintenance父调用30秒：探针最多18秒，为状态读写与停用接口保留时间。
         let result = app.run(host, request, 18, Some(job.2.clone()), true).await;
         let _guard = self.lock.lock().await;
-        let (mut state, version) = store::get::<State>(host, "monitor").await?;
+        let (mut state, version) = self.load(host).await?;
         if state.generation != job.2 {
             return Ok(());
         }
@@ -309,6 +371,7 @@ mod tests {
         settings.scheduled = true;
         assert!(settings.validate().is_err());
         settings.account_ids = vec!["account".into()];
+        settings.client_key_id = Some("key".into());
         assert!(settings.validate().is_ok());
         settings.interval_minutes = 0;
         assert!(settings.validate().is_err());

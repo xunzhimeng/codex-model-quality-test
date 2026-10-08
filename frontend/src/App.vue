@@ -67,16 +67,16 @@ async function loadModels() {
     if (!models.value.includes(model.value)) model.value = models.value.includes('gpt-6-astra') ? 'gpt-6-astra' : models.value[0] || ''
   } catch (e) { if (version === modelLoad) error.value = (e as Error).message } finally { if (version === modelLoad) modelsLoading.value = false }
 }
-function changeMode() { if (mode.value === 'probe' && !model.value) model.value = 'gpt-6-astra' }
-function selectAccounts() { selectedAccounts.value = visibleAccounts.value.filter(a => a.enabled && (mode.value !== 'probe' || a.probe_supported)).map(a => a.id) }
+function changeMode() { selectedAccounts.value = selectedAccounts.value.filter(id => catalog.value.accounts.some(a => a.id === id && (mode.value !== 'probe' || (a.probe_supported && a.proxy_configured)))) }
+function selectAccounts() { selectedAccounts.value = visibleAccounts.value.filter(a => a.enabled && (mode.value !== 'probe' || (a.probe_supported && a.proxy_configured))).map(a => a.id) }
 async function run() {
   error.value = ''; notice.value = ''
   if (!selectedAccounts.value.length || !model.value.trim()) { error.value = '请选择账号与模型'; return }
-  if (mode.value === 'question' && (!key.value || !selectedQuestions.value.length || !models.value.includes(model.value))) { error.value = '请选择可见模型、客户端Key与题目'; return }
+  if (!key.value || !models.value.includes(model.value) || (mode.value === 'question' && !selectedQuestions.value.length)) { error.value = '请选择客户端Key、可见模型及测试题目'; return }
   const accounts = catalog.value.accounts.filter(a => selectedAccounts.value.includes(a.id))
-  if (accounts.some(a => !a.enabled || (mode.value === 'probe' && !a.probe_supported))) { error.value = '选中账号不支持当前测试，请重新选择'; return }
+  if (accounts.some(a => !a.enabled || (mode.value === 'probe' && (!a.probe_supported || !a.proxy_configured)))) { error.value = '选中账号不支持当前测试，请重新选择'; return }
   const tasks = mode.value === 'probe' ? [null] : [...selectedQuestions.value]
-  const settings = { mode: mode.value, model: model.value.trim(), effort: mode.value === 'probe' ? 'default' : effort.value, client_key_id: mode.value === 'probe' ? null : key.value }
+  const settings = { mode: mode.value, model: model.value.trim(), effort: mode.value === 'probe' ? 'default' : effort.value, client_key_id: key.value }
   batchId.value = crypto.randomUUID(); const id = batchId.value; total.value = accounts.length * tasks.length; completed.value = 0
   running.value = true; stopping.value = false
   try {
@@ -132,28 +132,28 @@ onMounted(reload)
     <template v-if="tab === 'new'">
       <section class="panel">
         <div class="section-head"><nav class="segments" aria-label="测试类型"><button :class="{ active: mode === 'question' }" :disabled="running" @click="mode = 'question'">题目测试</button><button :class="{ active: mode === 'probe' }" :disabled="running" @click="mode = 'probe'; changeMode()">探针测试</button></nav>
-          <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链</template></div></details>
+          <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>账号未配置代理或代理失败时停止，不回退直连；令牌须在宿主刷新<br>Key仅限定范围，不经过Key计费／额度／租约链，探针模型使用实际上游名称且须在Key可见范围<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链</template></div></details>
         </div>
-        <div v-if="mode === 'probe'" class="alert warning">探针不走Key计费链，不继承账号专属代理，不自动刷新令牌 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
+        <div v-if="mode === 'probe'" class="alert warning">探针按所选Key校验账号与模型范围，强制使用账号代理；不计入Key账单 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
         <fieldset :disabled="running || loading">
           <div class="form-grid">
-            <label v-if="mode === 'question'">客户端Key<select v-model="key" @change="loadModels"><option value="">请选择</option><option v-for="k in catalog.keys.filter(k => k.enabled)" :key="k.id" :value="k.id">{{ k.name || k.id }}</option></select></label>
+            <label>客户端Key<select v-model="key" aria-label="客户端Key" @change="loadModels"><option value="">请选择</option><option v-for="k in catalog.keys.filter(k => k.enabled)" :key="k.id" :value="k.id">{{ k.name || k.id }}</option></select></label>
             <label>模型<input v-model="model" list="model-options" maxlength="128" :placeholder="modelsLoading ? '正在加载可见模型' : '请选择或输入模型'"><datalist id="model-options"><option v-for="name in models" :key="name" :value="name" /></datalist></label>
             <label v-if="mode === 'question'">思考强度<select v-model="effort"><option value="default">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option></select></label>
             <label>账号并发数<select v-model="concurrency"><option v-for="n in 4" :key="n" :value="n">{{ n }}</option></select></label>
           </div>
           <div class="selection-header"><strong>账号 <span class="muted">已选 {{ selectedAccounts.length }}</span></strong><div class="inline"><input v-model="accountFilter" aria-label="筛选账号" placeholder="搜索账号"><button type="button" @click="selectAccounts">选择筛选结果</button><button type="button" @click="selectedAccounts = []">取消选择</button></div></div>
-          <div class="account-list"><label v-for="account in visibleAccounts" :key="account.id" class="choice"><input v-model="selectedAccounts" type="checkbox" :value="account.id" :disabled="!account.enabled || (mode === 'probe' && !account.probe_supported)"><span>{{ account.name || account.id }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.provider }} · {{ account.authentication_kind }}{{ !account.enabled ? ' · 已停用' : mode === 'probe' && !account.probe_supported ? ' · 不适用或令牌过期' : '' }}</small></span></label><p v-if="!visibleAccounts.length" class="empty">暂无匹配账号</p></div>
+          <div class="account-list"><label v-for="account in visibleAccounts" :key="account.id" class="choice"><input v-model="selectedAccounts" type="checkbox" :value="account.id" :disabled="!account.enabled || (mode === 'probe' && (!account.probe_supported || !account.proxy_configured))"><span>{{ account.name || account.id }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.provider }} · {{ account.authentication_kind }}{{ !account.enabled ? ' · 已停用' : mode === 'probe' && !account.probe_supported ? ' · 不适用或令牌过期' : mode === 'probe' && !account.proxy_configured ? ' · 未配置代理' : '' }}</small></span></label><p v-if="!visibleAccounts.length" class="empty">暂无匹配账号</p></div>
           <template v-if="mode === 'question'">
             <div class="selection-header"><strong>测试题目 <span class="muted">已选 {{ selectedQuestions.length }}</span></strong><div class="inline"><button type="button" @click="selectedQuestions = catalog.questions.map(q => q.id)">全选</button><button type="button" @click="selectedQuestions = []">取消选择</button></div></div>
             <div class="question-list"><label v-for="q in catalog.questions" :key="q.id" class="choice"><input v-model="selectedQuestions" type="checkbox" :value="q.id"><span>{{ q.title }}<small>{{ q.category }}</small></span></label></div>
             <details v-if="selectedQuestion" class="question-preview"><summary>查看首道所选题目</summary><pre>{{ selectedQuestion.prompt }}</pre><span class="muted">标准答案 {{ selectedQuestion.answer }}</span></details>
           </template>
         </fieldset>
-        <div class="runbar"><span class="muted">{{ running ? `已完成 ${completed} / ${total}` : '同一账号按题目顺序执行，关闭页面后不再发送后续任务' }}</span><button v-if="running" :disabled="stopping" @click="stopping = true">{{ stopping ? '等待已发送任务结束' : '停止后续任务' }}</button><button v-else class="primary" :disabled="loading || !selectedAccounts.length || !model || (mode === 'question' && (!key || modelsLoading || !selectedQuestions.length))" @click="run">{{ mode === 'probe' ? '开始探针' : '开始测试' }}</button></div>
+        <div class="runbar"><span class="muted">{{ running ? `已完成 ${completed} / ${total}` : '同一账号按题目顺序执行，关闭页面后不再发送后续任务' }}</span><button v-if="running" :disabled="stopping" @click="stopping = true">{{ stopping ? '等待已发送任务结束' : '停止后续任务' }}</button><button v-else class="primary" :disabled="loading || !selectedAccounts.length || !model || !key || modelsLoading || (mode === 'question' && !selectedQuestions.length)" @click="run">{{ mode === 'probe' ? '开始探针' : '开始测试' }}</button></div>
       </section>
     </template>
-    <MonitorPanel v-if="tab === 'monitor'" :accounts="catalog.accounts" />
+    <MonitorPanel v-if="tab === 'monitor'" :accounts="catalog.accounts" :keys="catalog.keys" />
     <section v-if="tab === 'bank'" class="panel">
       <div class="section-head"><strong>自定义题库</strong><button class="primary" :disabled="bankSaving" @click="saveBank">{{ bankSaving ? '正在保存' : '保存题库' }}</button></div>
       <p class="muted">最多30道，每题包含 id、title、category、prompt、answer，ID以 custom_ 开头</p>

@@ -1,12 +1,13 @@
 <script setup lang="ts">
 interface Round { phase: string; http_status: number | null; elapsed_ms: number; completed: boolean; response_bytes: number; ticket_present: boolean; ticket_length: number; routing_cookie_count: number; reported_model: string | null; error: string | null }
-interface Metrics { rounds?: Round[]; source?: string; criterion?: string; new_ticket?: boolean; monitor?: { streak?: number; threshold?: number; action?: string; detail?: string } }
+interface Metrics { rounds?: Round[]; source?: string; transport?: string; client_key_id?: string; key_billed?: boolean; criterion?: string; new_ticket?: boolean; monitor?: { streak?: number; threshold?: number; action?: string; detail?: string } }
 defineProps<{ metrics: Metrics }>()
 function action(value?: string) { return ({ disabled: '账号已自动停用', pending: '停用结果待确认', unconfirmed: '停用未确认，请检查账号状态' } as Record<string, string>)[value || ''] || '未触发停用' }
 </script>
 <template>
   <div class="probe-details">
     <p class="muted">来源：{{ metrics.source === 'scheduled' ? '后台定时探针' : '手动探针' }} · 门票与Cookie只展示存在性和长度，不保存原文</p>
+    <p v-if="metrics.transport === 'account_proxy'" class="muted">网络路径：账号代理 · Key仅限定范围，不计入账单</p>
     <div v-if="metrics.rounds?.length" class="round-grid">
       <section v-for="round in metrics.rounds" :key="round.phase" class="round-card">
         <strong>{{ round.phase }}</strong>

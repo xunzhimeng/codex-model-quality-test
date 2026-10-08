@@ -1,8 +1,5 @@
-use crate::store::{now_ms, payload_call};
-use gateway_plugin_sdk::{
-    call::host::{AuthCredential, AuthGetRequest, AuthRuntimeAccount, HttpRequest, HttpResponse},
-    client::HostClient,
-};
+use crate::{proxy_transport, store::now_ms};
+use gateway_plugin_sdk::{call::host::AuthRuntimeAccount, client::HostClient};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -83,6 +80,8 @@ pub async fn run(
             )
         }
     };
+    metrics["transport"] = json!("account_proxy");
+    metrics["key_billed"] = json!(false);
     metrics["rounds"] = json!(rounds);
     metrics["criterion"] =
         json!("仅在两轮完整成功时比较门票；续接返回不同门票标记疑似降级，不依据模型名称");
@@ -100,38 +99,24 @@ async fn execute(
     rounds: &mut Vec<Round>,
 ) -> Result<ProbeResult, String> {
     eligibility(account).map_err(str::to_owned)?;
-    let credential: AuthCredential = payload_call(
+    let connection = proxy_transport::connection(
         host,
-        "host.auth.get",
-        &AuthGetRequest {
-            account_id: account.account_id.clone(),
-        },
+        &account.account_id,
+        account
+            .upstream_account_id
+            .as_deref()
+            .ok_or("账号缺少上游标识")?,
     )
     .await?;
-    if credential.credential_revision != account.credential_revision
-        || credential.facts.authentication_kind != "oauth"
-    {
-        return Err("账号凭据已变化，请重新加载账号".into());
-    }
-    let token = credential
-        .facts
-        .material
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or("账号缺少访问令牌")?;
-    let account_id = credential
-        .facts
-        .upstream_account_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or("账号缺少上游账号标识")?;
+    let client = &connection.client;
+    let token = connection.token.as_str();
+    let account_id = connection.upstream_id.as_str();
     rounds.push(Round {
         phase: "首轮获取门票".into(),
         ..Round::default()
     });
     let first = measured_shot(
-        host,
+        client,
         token,
         account_id,
         model,
@@ -152,7 +137,7 @@ async fn execute(
         ..Round::default()
     });
     let second = measured_shot(
-        host,
+        client,
         token,
         account_id,
         model,
@@ -180,7 +165,7 @@ fn new_ticket(first: &str, second: &str) -> bool {
 }
 
 async fn measured_shot(
-    host: &HostClient,
+    client: &reqwest::Client,
     token: &str,
     account_id: &str,
     model: &str,
@@ -190,7 +175,7 @@ async fn measured_shot(
 ) -> Result<Shot, String> {
     let start = Instant::now();
     round.started = Some(start);
-    let result = shot(host, token, account_id, model, ticket, cookies, round).await;
+    let result = shot(client, token, account_id, model, ticket, cookies, round).await;
     round.elapsed_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     if let Err(error) = &result {
         round.error = Some(error.clone());
@@ -199,7 +184,7 @@ async fn measured_shot(
 }
 
 async fn shot(
-    host: &HostClient,
+    client: &reqwest::Client,
     token: &str,
     account_id: &str,
     model: &str,
@@ -207,7 +192,7 @@ async fn shot(
     cookies: &[String],
     round: &mut Round,
 ) -> Result<Shot, String> {
-    let mut headers = vec![
+    let mut headers: Vec<(String, String)> = vec![
         ("authorization".into(), format!("Bearer {token}")),
         ("chatgpt-account-id".into(), account_id.into()),
         ("content-type".into(), "application/json".into()),
@@ -231,45 +216,33 @@ async fn shot(
     if !cookies.is_empty() {
         headers.push(("cookie".into(), cookies.join("; ")));
     }
-    let request = HttpRequest {
-        method: "POST".into(),
-        url: ENDPOINT.into(),
-        headers,
-    };
     let body = json!({"model":model,"instructions":"Reply with OK.","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with OK."}]}],"stream":true,"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"]});
-    let reply = host
-        .call(
-            "host.http.do_stream",
-            serde_json::to_value(request).map_err(|_| "探针请求编码失败")?,
-            serde_json::to_vec(&body).map_err(|_| "探针正文编码失败")?,
-        )
-        .await
-        .map_err(|_| "探针网络调用未完成，无法判断")?;
-    let response: HttpResponse =
-        serde_json::from_value(reply.result).map_err(|_| "探针响应格式无效")?;
-    let stream = response.stream.as_deref().ok_or("探针未提供响应流")?;
-    round.http_status = Some(response.status);
-    let result = read_shot(host, &response, stream, round).await;
-    // 失败或超过正文上限时也主动释放流，父调用取消由SDK负责回收。
-    if result.is_err() {
-        let _ = host
-            .call("host.http.stream_close", json!({"stream":stream}), vec![])
-            .await;
+    let mut request = client.post(ENDPOINT);
+    for (name, value) in headers {
+        request = request.header(name, value);
     }
-    result
+    let mut response = request
+        .body(serde_json::to_vec(&body).map_err(|_| "探针正文编码失败")?)
+        .send()
+        .await
+        .map_err(|_| "账号代理出站失败，禁止回退直连")?;
+    round.http_status = Some(response.status().as_u16());
+    read_shot(&mut response, round).await
 }
 
-async fn read_shot(
-    host: &HostClient,
-    response: &HttpResponse,
-    stream: &str,
-    round: &mut Round,
-) -> Result<Shot, String> {
+async fn read_shot(response: &mut reqwest::Response, round: &mut Round) -> Result<Shot, String> {
     let mut out = Shot {
-        status: response.status,
+        status: response.status().as_u16(),
         ..Shot::default()
     };
-    for (name, value) in &response.headers {
+    for (name, value) in response.headers() {
+        let name = name.as_str();
+        if !name.eq_ignore_ascii_case("x-codex-turn-state")
+            && !name.eq_ignore_ascii_case("set-cookie")
+        {
+            continue;
+        }
+        let value = value.to_str().map_err(|_| "探针响应头编码无效")?;
         if name.eq_ignore_ascii_case("x-codex-turn-state") {
             if value.len() > 8192 || value.bytes().any(|b| b.is_ascii_control()) {
                 return Err("门票头无效，无法判断".into());
@@ -293,8 +266,8 @@ async fn read_shot(
     round.ticket_present = !out.ticket.is_empty();
     round.ticket_length = out.ticket.len();
     round.routing_cookie_count = out.cookies.len();
-    if response.status != 200 {
-        return Err(match response.status {
+    if response.status().as_u16() != 200 {
+        return Err(match response.status().as_u16() {
             401 | 403 => "上游拒绝认证，请核对令牌与账号权限",
             429 => "上游限流或额度不足，无法判断",
             _ => "上游未成功响应，无法判断",
@@ -302,28 +275,16 @@ async fn read_shot(
         .into());
     }
     let mut body = Vec::new();
-    loop {
-        let reply = host
-            .call(
-                "host.http.stream_read",
-                json!({"stream":stream,"maximum_bytes":65536}),
-                vec![],
-            )
-            .await
-            .map_err(|_| "探针响应流未完整读取，无法判断")?;
-        if body.len() + reply.payload.len() > MAX_BODY {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "代理响应流未完整读取，无法判断")?
+    {
+        if body.len() + chunk.len() > MAX_BODY {
             return Err("探针响应超过上限，无法判断".into());
         }
-        body.extend(reply.payload);
+        body.extend(chunk);
         round.response_bytes = body.len();
-        if reply
-            .result
-            .get("eof")
-            .and_then(Value::as_bool)
-            .ok_or("探针流响应格式无效")?
-        {
-            break;
-        }
     }
     out.model = parse_completion(&body)?;
     round.completed = true;

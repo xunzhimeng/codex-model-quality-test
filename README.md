@@ -23,11 +23,11 @@
 
 ![题目测试](docs/screenshots/light.png)
 
-![门票探针](docs/screenshots/probe.png)
+![门票探针](docs/screenshots/probe-v030.png)
 
 [查看暗色窄屏截图](docs/screenshots/dark-narrow.png)
 
-[分轮探针详情](docs/screenshots/probe-details-v020.png) · [定时监控设置](docs/screenshots/monitor-v020.png)（隔离 iframe 内使用固定宿主页组装器与内存回调桩验证）
+[分轮探针详情](docs/screenshots/probe-details-v030.png) · [定时监控设置](docs/screenshots/monitor-v030.png)（隔离 iframe 内使用固定宿主页组装器、内存回调及本机认证代理／TLS桩验证）
 
 ## 使用
 
@@ -45,7 +45,9 @@
 
 ## 门票探针边界
 
-探针仅适用于 **OpenAI OAuth**，通过 `host.auth.get` 在后端取得当前访问令牌，通过宿主 `host.http.do_stream` 向固定的 ChatGPT Codex Responses 端点发送两条极短请求：
+探针仅适用于 **OpenAI OAuth**。手动与定时探针都必须选择客户端 Key，每次执行重新核对 Key 启用状态、Key 可见模型、启用账号组归属和账号模型政策。Key 仅用于范围校验，**不代表经过 Key 计费、额度或账号租约链**；账号模型映射不会自动应用，输入名称须是实际上游模型且在所选 Key 的可见目录内。
+
+出站必须使用账号管理中配置的完整代理，支持 HTTP、HTTPS、SOCKS5、SOCKS5H 代理（包括认证）。账号未配置代理、导出缺少代理、代理无法连接或失败均停止探测，不回退直连，也不使用环境代理。两轮向固定的 `https://chatgpt.com/backend-api/codex/responses` 端点发送极短请求：
 
 1. 首轮不带门票及 Cookie，读取 `x-codex-turn-state` 和 `__cflb` / `__oailb` 路由 Cookie
 2. 同一账号携带首轮门票及路由 Cookie 再发一轮
@@ -53,21 +55,24 @@
 
 缺少首轮门票、认证失败、限流、流不完整或网络错误均显示「无法判断」。不依据响应 `model` 字段判定。该判据参考 [sub2api 固定提交实现](https://github.com/ranxi2001/sub2api/blob/1c28a9f5a1e9fbc00eb4f25c7f0e77a81c8e45fd/backend/internal/service/openai_codex_state_probe.go#L93-L198)，不是 OpenAI 官方质量保证，应结合重复测试趋势与题目结果。
 
-按本插件实现边界，探针**不经过 Key 计费、账号模型映射、账号租约或账号专属代理，不自动刷新令牌**，因此模型输入使用上游实际名称，宿主须具备到 ChatGPT 的网络连通性。OAuth 令牌过期时先在宿主刷新。出站网络仍受宿主安全策略及期限约束。请求身份采用当前固定宿主提交中的离线 CLI 版本 `0.155.0`，不跟踪官方版本更新，无法取得宿主动态客户端画像或 TLS 画像，真实上游兼容性需在目标环境验证。
+CPR 3.21.1 普通 `host.http.*` 没有指定账号代理合同，安全账号列表又只提供脱敏端点。因此插件通过受管内部 `host.http.dispatch` 调用 `GET /api/admin/accounts/export?accountIds=<当前单账号ID>&confirm=export_sensitive_accounts`，只请求当前一个账号。导出同时包含敏感令牌：插件在内存校验 Provider、内外部账号ID及数量，提取访问令牌和完整代理URL，其余字段直接丢弃。不缓存、存盘或返回导出文档，不把代理认证放入状态、界面或日志。
+
+上游出站由插件自己的 reqwest 客户端负责，固定目标、正常 TLS 证书验证、禁用重定向与自动重试；**不经过宿主受管网络发送器或其网络策略、原生 TLS 画像、账号代理租约**，父调用取消时直接丢弃本轮网络 future。仍受插件自己及宿主父调用期限限制。不自动刷新令牌，过期时先在宿主刷新。请求身份使用固定宿主提交中的离线 CLI 版本 `0.155.0`，真实上游兼容性需在目标环境验证。
 
 令牌、门票及 Cookie 只用于本次调用内存，不返回页面、不存历史、不写日志。插件不保存或刷新账号凭据；仅在明确启用自动停用且满足规则时修改账号启用状态，不修改模型路由。
 
 ## 定时监控与自动停用
 
-管理页「定时监控」中分别设置「启用定时探针」和「连续两轮疑似降级后自动停用账号」，默认均关闭。选择1至50个 OpenAI OAuth 账号、实际上游模型和间隔（5至1440分钟，默认30分钟），保存后首轮在该间隔之后执行。题目测试不加入定时计划或停用判定。
+管理页「定时监控」中分别设置「启用定时探针」和「连续两轮疑似降级后自动停用账号」，默认均关闭。选择客户端 Key、1至50个已配置代理的 OpenAI OAuth 账号、实际上游模型和间隔（5至1440分钟，默认30分钟），保存后首轮在该间隔之后执行。题目测试不加入定时计划或停用判定。
 
-- 仅同一设置代次、同一账号、同一模型的连续两轮 `degraded` 结果触发停用；一次答错、超时、HTTP失败、认证失败或无法判断均不算降级，并中断连续计数。切换设置会重置计数与到期时间。
-- 自动停用开关也作用于所选账号、同一模型的手动探针，定时开关关闭不等于自动停用关闭。保存设置仅影响后续动作，不撤回已发出的停用请求。
+- 仅同一设置代次、同一账号、同一Key和模型的连续两轮 `degraded` 结果触发停用；一次答错、超时、HTTP失败、认证失败或无法判断均不算降级，并中断连续计数。切换设置会重置计数与到期时间。
+- 自动停用开关也作用于所选账号、同一Key和模型的手动探针，定时开关关闭不等于自动停用关闭。保存设置仅影响后续动作，不撤回已发出的停用请求。
 - 使用宿主约30秒一次的 `plugin.reconcile` 维护回调，每次最多处理一个到期账号，不启动脱离父调用的上游请求。定时探针最多等待18秒，为30秒维护期限内的状态记录及停用操作预留时间；繁忙、多账号或大目录时可顺延、跳过或超时，不保证严格每30分钟一次。
 - 关闭页面后维护回调仍运行，停用插件后停止。下一到期时间先落盘，进程重启不会重发已经预约的轮次，也不追补错过的全部周期。
 - 启用自动停用后通过 `host.http.dispatch` 调用宿主 `POST /api/admin/accounts/batch-update`，只发送所选内部账号ID及 `enabled:false`，不修改凭据、代理、账号组或模型映射。账号目录备注通过同一受管通道读取安全账号列表。宿主采用插件管理身份，无须保存或转发浏览器管理令牌。
 - 停用前记录动作意图，停用后回读启用状态；回包、写回或发布中断时保留未确认状态，不自动重复停用。请在宿主账号管理手动核对。账号不会自动启用；手动恢复后，新一轮探针重新从1次计数。
 - 设置、计数、到期时间和停用结果保存在独立的 `monitor` 私有记录中，沿用旧版 `history` 与 `bank`，不修改现有历史格式。旧记录仍保留原名称快照，页面优先展示当前目录名称。
+- 升级前的无Key／无账号代理旧计划会在首次读取或维护时自动暂停，清空连续命中计数，保留停用动作审计；请选择Key、核对账号代理后重新保存并启用，旧历史和题库不变。
 
 探针判据是经验信号，自动停用可能误判，启用前请评估可用账号数量与业务影响。
 
@@ -95,6 +100,7 @@ cargo +1.97.0 fmt -- --check
 cargo +1.97.0 clippy --all-targets --locked -- -D warnings
 cargo +1.97.0 test --locked
 cargo +1.97.0 build --locked
+python -m pip install -r tests/requirements.txt
 python tests/protocol_test.py
 pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend build
@@ -103,6 +109,6 @@ cargo +1.97.0 build --release --locked --target x86_64-unknown-linux-gnu
 cpr-plugin package --manifest plugin.json --binary target/x86_64-unknown-linux-gnu/release/model-quality-test --target x86_64-unknown-linux-gnu --resource-map web=web --output-dir dist
 ```
 
-Rust 使用公开 SDK，不依赖宿主内部模块。协议集成测试启动真实插件进程，宿主回调全部为内存桩，不使用真实令牌或发送上游请求；Windows 和 Linux 本机构建产物均可测试。前端为 Vue SFC + TypeScript，通过 Vite 库模式生成包含 Vue 的单个 IIFE 经典脚本，HTML 使用 `frontend/public/index.html`，不引用模块或外部依赖。开发入口的 ES Module 只用于本地开发，不能作为宿主页交付，生产构建后再运行前端测试检查实际产物。
+Rust 使用公开 SDK，不依赖宿主内部模块。协议集成测试启动真实插件进程，宿主回调为内存桩，网络为本机认证 CONNECT 代理与临时 CA 签发的 TLS 上游桩，不解析或连接真实 ChatGPT，不使用真实令牌。测试 CA 通过子进程的 `SSL_CERT_FILE` 传入，不安装到系统信任库。Windows 和 Linux 本机构建产物均可测试。前端为 Vue SFC + TypeScript，通过 Vite 库模式生成包含 Vue 的单个 IIFE 经典脚本，HTML 使用 `frontend/public/index.html`，不引用模块或外部依赖。开发入口的 ES Module 只用于本地开发，不能作为宿主页交付，生产构建后再运行前端测试检查实际产物。
 
 打包工具必须与目标宿主合同一致，使用 `v3.21.1` 源码构建的 `cpr-plugin`，不要复用旧版协议 1 的打包工具。CLI 仅校验和生成安装包，不编译插件。ARM64 环境需改用 `aarch64-unknown-linux-gnu`，不能只更改包的平台声明。
