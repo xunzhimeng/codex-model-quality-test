@@ -355,6 +355,30 @@ class Integration(unittest.TestCase):
         self.assertEqual(prior['status'],'running')
         self.assertTrue(self.run_request('fixture-parent-cancel','probe')[1]['replayed'])
         self.assertEqual(self.host.proxy.connects,3)
+    def test_detail_and_response_errors_are_classified_without_secret_persistence(self):
+        self.host.http_status=400
+        message="The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account fixture-token-not-real"
+        for index,body in enumerate([
+            {'detail':message},
+            {'detail':{'message':message}},
+            {'error':message},
+            {'response':{'error':{'message':message}}},
+            {'message':message},
+            {'error':None,'detail':message},
+        ]):
+            with self.subTest(body=body):
+                self.host.error_body=body
+                status,result=self.run_request(f'fixture-envelope-{index}','probe')
+                self.assertEqual(status,200,result)
+                record=result['record']
+                self.assertEqual(record['status'],'inconclusive')
+                self.assertIn('上游不支持该模型',record['detail'])
+                self.assertIn('HTTP 400',record['detail'])
+                self.assertEqual(record['metrics']['rounds'][0]['error'],record['detail'])
+                self.assertGreater(record['metrics']['rounds'][0]['response_bytes'],0)
+                self.assertNotIn(message,dump(self.host.states).decode())
+                self.assertNotIn('fixture-token-not-real',dump(self.host.states).decode())
+        self.assertEqual(self.host.proxy.connects,6)
     def test_rejection_reason_is_classified_without_echoing_secrets(self):
         self.host.http_status=400
         self.host.error_body={'error':{'code':'model_not_found','message':'fixture-token-not-real model does not exist'}}

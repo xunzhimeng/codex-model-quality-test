@@ -311,20 +311,35 @@ async fn read_shot(response: &mut reqwest::Response, round: &mut Round) -> Resul
 }
 
 fn rejection_reason(body: &[u8]) -> Option<&'static str> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let code = value
-        .pointer("/error/code")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let param = value
-        .pointer("/error/param")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let message = value
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    // 沿用宿主的错误封装顺序，只提取分类字段，不返回或持久化上游原文。
+    let value: Value = serde_json::from_slice(body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()));
+    let error = [
+        value.pointer("/response/error"),
+        value.get("error"),
+        value.get("detail"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|error| !error.is_null())
+    .unwrap_or(&value);
+    let field = |name: &str| {
+        error
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| value.get(name).and_then(Value::as_str))
+            .unwrap_or("")
+    };
+    let code = field("code");
+    let param = field("param");
+    let message = field("message");
+    let message = if message.is_empty() {
+        error.as_str().unwrap_or("")
+    } else {
+        message
+    }
+    .to_ascii_lowercase();
     // 结构化字段比文案关键词可靠，参数错误的说明也可能包含“this model”。
     if matches!(code, "unsupported_parameter" | "unsupported_value")
         || matches!(
@@ -411,6 +426,56 @@ pub fn parse_completion(body: &[u8]) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recognizes_error_envelopes_without_returning_upstream_text() {
+        let message = "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account fixture-secret";
+        for value in [
+            json!({"detail":message}),
+            json!({"detail":{"message":message}}),
+            json!({"error":{"message":message}}),
+            json!({"error":message}),
+            json!({"response":{"error":{"message":message}}}),
+            json!({"message":message}),
+            json!(message),
+            json!({"error":null,"detail":message}),
+        ] {
+            let body = serde_json::to_vec(&value).unwrap();
+            let reason = rejection_reason(&body).unwrap();
+            assert!(reason.starts_with("上游不支持该模型"));
+            assert!(!reason.contains("fixture-secret"));
+        }
+        assert!(
+            rejection_reason(message.as_bytes())
+                .unwrap()
+                .starts_with("上游不支持该模型")
+        );
+        for body in [
+            b"fixture-secret unknown failure".as_slice(),
+            b"{\"detail\":\"fixture-secret unknown failure\"}",
+            b"{\"detail\":null}",
+        ] {
+            assert_eq!(rejection_reason(body), None);
+        }
+    }
+    #[test]
+    fn nested_structured_rejection_takes_priority_and_uses_root_fields() {
+        for value in [
+            json!({"detail":{"code":"unsupported_parameter","message":"not supported for this model"}}),
+            json!({"response":{"error":{"code":"unsupported_parameter","message":"not supported for this model"}}}),
+            json!({"code":"unsupported_parameter","detail":"not supported for this model"}),
+            json!({"code":"unsupported_parameter","error":{"code":null,"message":"not supported for this model"}}),
+        ] {
+            assert_eq!(
+                rejection_reason(&serde_json::to_vec(&value).unwrap()),
+                Some("上游不支持探针请求中的参数")
+            );
+        }
+        let value = json!({"response":{"error":{"code":"token_expired"}},"error":{"code":"model_not_found"}});
+        assert_eq!(
+            rejection_reason(&serde_json::to_vec(&value).unwrap()),
+            Some("访问令牌无效或已过期，请先在宿主刷新账号")
+        );
+    }
     #[test]
     fn structured_rejection_takes_priority_over_model_wording() {
         for (code, param, expected) in [
