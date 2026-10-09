@@ -59,6 +59,7 @@ class Host:
         self.fail_disable = False
         self.body_streams = {}
         self.on_stream = None
+        self.on_account_read = None
         self.stall_stream = False
         self.write({'type':'hello','handshake':{'protocol_version':2,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':1,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
@@ -90,7 +91,9 @@ class Host:
         if method.startswith('host.auth.'):
             assert params=={}; request=json.loads(body)
             if method=='host.auth.list': payload=dump({'accounts':[account],'next_cursor':None})
-            elif method=='host.auth.get_runtime': payload=dump(account)
+            elif method=='host.auth.get_runtime':
+                if self.on_account_read:self.on_account_read()
+                payload=dump(account)
             else:raise AssertionError('unexpected credential read '+method)
         elif method=='host.data.keys.get':
             assert params=={} and json.loads(body)=={'client_key_id':'fixture-key'}
@@ -190,14 +193,198 @@ class Integration(unittest.TestCase):
     def tearDown(self): self.host.close()
     def run_request(self,id,mode='question',model='fixture-model'):
         return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':model,'effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key','question_id':'candy' if mode=='question' else None})
-    def configure_monitor(self,scheduled=True,auto_disable=True):
+    def configure_monitor(self,scheduled=True,auto_disable=True,**settings):
         snapshot=self.host.call('GET','monitor')[1]
-        status,result=self.host.call('POST','monitor',{'settings':{'scheduled':scheduled,'auto_disable':auto_disable,'interval_minutes':30,'model':'fixture-model','client_key_id':'fixture-key','account_ids':['fixture-account']},'expected_generation':snapshot['state']['generation'] or None})
+        config={'scheduled':scheduled,'auto_disable':auto_disable,'interval_minutes':30,'model':'fixture-model','client_key_id':'fixture-key','account_ids':['fixture-account'],'daily_max':48,'quiet_hours':None}
+        config.update(settings)
+        status,result=self.host.call('POST','monitor',{'settings':config,'expected_generation':snapshot['state']['generation'] or None})
         self.assertEqual(status,200,result)
         return result
-    def due(self):
-        state=self.host.states['monitor']['value']
-        state['accounts']['fixture-account']['next_due_ms']=0
+    def due(self,confirmation=False):
+        status=self.host.states['monitor']['value']['accounts']['fixture-account']
+        if confirmation:status['confirm_due_ms']=int(time.time()*1000)-1000
+        else:status['next_due_ms']=0
+    def control(self,paused,account_id=None,snapshot=None):
+        state=(snapshot or self.host.call('GET','monitor')[1])['state']
+        return self.host.call('POST','monitor/control',{'paused':paused,'account_id':account_id,'expected_generation':state['generation'],'expected_control_revision':state['control_revision']})
+    def test_immediate_policy_disables_on_first_degraded_without_confirmation(self):
+        self.configure_monitor(degradation_policy='immediate',daily_max=1)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        snapshot=self.host.call('GET','monitor')[1]
+        state=snapshot['state']['accounts']['fixture-account']
+        self.assertEqual(state['streak'],1);self.assertIsNone(state['confirm_due_ms'])
+        self.assertEqual(snapshot['total_runs'],1);self.assertEqual(snapshot['daily_runs'],1)
+        self.assertEqual(self.host.disable_count,1);self.assertFalse(self.host.account_enabled)
+        metrics=self.host.states['history']['value']['records'][-1]['metrics']['monitor']
+        self.assertEqual(metrics['policy'],'immediate');self.assertEqual(metrics['threshold'],1)
+        self.assertFalse(metrics['confirmation']);self.assertIn('首次疑似降级',metrics['detail'])
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.proxy.connects,2);self.assertEqual(self.host.disable_count,1)
+    def test_immediate_policy_requires_switch_and_explicit_degraded(self):
+        self.configure_monitor(degradation_policy='immediate',auto_disable=False)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,0)
+        self.assertIsNone(self.host.states['monitor']['value']['accounts']['fixture-account']['confirm_due_ms'])
+        self.configure_monitor(degradation_policy='immediate')
+        self.host.http_status=400;self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,0)
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
+        self.host.http_status=200;self.host.ticket_second='ticket-first'
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,0)
+    def test_configured_delay_longer_than_interval_is_not_overridden(self):
+        self.configure_monitor(confirmation_delay_seconds=600,interval_minutes=5)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(state['confirm_due_ms'],record['finished_at_ms']+600000)
+        self.assertEqual(state['next_due_ms'],state['confirm_due_ms']+300000)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.proxy.connects,2)
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        state['next_due_ms']=int(time.time()*1000)+300000
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,1)
+        self.assertEqual(self.host.call('GET','monitor')[1]['total_runs'],2)
+    def test_failed_confirmation_never_disables_or_retries_again(self):
+        self.configure_monitor(confirmation_delay_seconds=5)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(state['confirm_due_ms'],record['finished_at_ms']+5000)
+        self.host.http_status=429;self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertEqual(state['total_runs'],2);self.assertEqual(state['streak'],0)
+        self.assertIsNone(state['confirm_due_ms']);self.assertEqual(self.host.disable_count,0)
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,3)
+    def test_policy_change_discards_old_confirmation_and_keeps_counts(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertIsNotNone(self.host.states['monitor']['value']['accounts']['fixture-account']['confirm_due_ms'])
+        self.configure_monitor(degradation_policy='immediate')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertIsNone(state['confirm_due_ms']);self.assertEqual(state['streak'],0)
+        self.assertEqual(state['total_runs'],1);self.assertEqual(self.host.disable_count,0)
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,2)
+    def test_invalid_policy_or_delay_rejected_without_side_effects(self):
+        config=self.configure_monitor()
+        for field,value in [('degradation_policy','unknown'),('confirmation_delay_seconds',0),('confirmation_delay_seconds',86401),('confirmation_delay_seconds',1.5)]:
+            with self.subTest(field=field,value=value):
+                settings={**config['state']['settings'],field:value}
+                status,_=self.host.call('POST','monitor',{'settings':settings,'expected_generation':config['state']['generation']})
+                self.assertEqual(status,400)
+        self.assertEqual(self.host.call('GET','monitor')[1]['state']['generation'],config['state']['generation'])
+        self.assertEqual(self.host.export_count,0);self.assertEqual(self.host.disable_count,0)
+    def test_existing_settings_default_to_confirmation_not_immediate(self):
+        self.configure_monitor()
+        state=self.host.states['monitor']['value'];state['settings'].pop('degradation_policy');state['settings'].pop('confirmation_delay_seconds')
+        snapshot=self.host.call('GET','monitor')[1]['state']
+        self.assertEqual(snapshot['settings']['degradation_policy'],'confirm')
+        self.assertEqual(snapshot['settings']['confirmation_delay_seconds'],60)
+        self.assertTrue(snapshot['settings']['scheduled'])
+    def test_v033_plan_migration_preserves_audit_and_is_idempotent(self):
+        self.configure_monitor()
+        state=self.host.states['monitor']['value'];state['probe_version']=1
+        state['settings'].pop('daily_max');state['settings'].pop('quiet_hours')
+        state['accounts']['fixture-account'].update({'action':'unconfirmed','action_detail':'fixture audit','streak':1})
+        first=self.host.call('GET','monitor')[1]['state']
+        self.assertFalse(first['settings']['scheduled']);self.assertFalse(first['settings']['auto_disable'])
+        self.assertEqual(first['settings']['daily_max'],48);self.assertEqual(first['settings']['client_key_id'],'fixture-key')
+        self.assertEqual(first['accounts']['fixture-account']['action'],'unconfirmed')
+        self.assertEqual(first['accounts']['fixture-account']['streak'],0)
+        self.assertEqual(first['generation'],self.host.call('GET','monitor')[1]['state']['generation'])
+        self.assertEqual(self.host.proxy.connects,0)
+    def test_pause_before_begin_does_not_leave_running_history_or_count(self):
+        self.configure_monitor();self.due()
+        def pause():
+            state=self.host.states['monitor'];state['value']['paused']=True;state['version']+=1
+        self.host.on_account_read=pause
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.proxy.connects,0);self.assertEqual(self.host.call('GET','monitor')[1]['total_runs'],0)
+        self.assertEqual(self.host.call('GET','history')[1]['records'],[])
+    def test_expired_confirmation_starts_fresh_without_disabling(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.due(confirmation=True);self.due()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertEqual(state['total_runs'],2);self.assertEqual(state['streak'],1)
+        self.assertEqual(self.host.disable_count,0)
+        self.assertFalse(self.host.states['history']['value']['records'][-1]['metrics']['monitor']['confirmation'])
+    def test_confirmation_waits_one_minute_and_counts_both_attempts(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(state['confirm_due_ms'],record['finished_at_ms']+60000)
+        self.assertEqual(state['total_runs'],1);self.assertEqual(state['daily_runs'],1)
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(len(self.host.http),2);self.assertEqual(self.host.disable_count,0)
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.call('GET','monitor')[1]
+        self.assertEqual(state['total_runs'],2);self.assertEqual(state['daily_runs'],2)
+        self.assertEqual(self.host.disable_count,1)
+    def test_daily_quota_blocks_confirmation_and_save_does_not_reset_counts(self):
+        config=self.configure_monitor(daily_max=1);self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertIsNone(state['confirm_due_ms']);self.assertEqual(state['streak'],0)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(len(self.host.http),2);self.assertEqual(self.host.disable_count,0)
+        status,snapshot=self.host.call('POST','monitor',{'settings':config['state']['settings'],'expected_generation':config['state']['generation']})
+        self.assertEqual(status,200);self.assertEqual(snapshot['daily_runs'],1)
+        self.assertEqual(snapshot['availability']['fixture-account']['status'],'今日已达上限')
+        self.host.states['monitor']['value']['accounts']['fixture-account']['count_day']-=1
+        self.assertEqual(self.host.call('GET','monitor')[1]['daily_runs'],0)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.call('GET','monitor')[1]['total_runs'],2)
+    def test_quiet_hours_block_background_not_manual(self):
+        minute=(int(time.time())//60+480)%1440
+        hhmm=lambda value:f'{value//60:02d}:{value%60:02d}'
+        self.configure_monitor(quiet_hours={'start':hhmm((minute-2)%1440),'end':hhmm((minute+2)%1440)})
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.proxy.connects,0)
+        snap=self.host.call('GET','monitor')[1];self.assertEqual(snap['availability']['fixture-account']['status'],'不测试时段')
+        self.assertGreater(snap['availability']['fixture-account']['next_allowed_ms'],int(time.time()*1000))
+        self.run_request('fixture-manual-during-quiet','probe')
+        self.assertEqual(self.host.proxy.connects,2);self.assertEqual(self.host.call('GET','monitor')[1]['total_runs'],0)
+    def test_pause_resume_and_stale_control_preserve_counts(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        stale=self.host.call('GET','monitor')[1]
+        self.assertEqual(self.control(True,'fixture-account')[0],200)
+        self.assertEqual(self.control(True,snapshot=stale)[0],400)
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertIsNone(state['confirm_due_ms']);self.assertEqual(state['streak'],0)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,2)
+        self.assertEqual(self.control(True)[0],200);self.assertEqual(self.control(False,'fixture-account')[0],200)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,2)
+        self.assertEqual(self.control(False)[0],200)
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,2)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.call('GET','monitor')[1]['total_runs'],2);self.assertEqual(self.host.disable_count,0)
+    def test_pause_inflight_confirmation_prevents_disable_and_counts_once(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        def pause():
+            state=self.host.states['monitor'];state['value']['paused']=True
+            state['value']['accounts']['fixture-account']['active']['valid']=False;state['version']+=1
+        self.host.on_stream=pause
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        snap=self.host.call('GET','monitor')[1];self.assertEqual(snap['total_runs'],2)
+        self.assertEqual(self.host.disable_count,0);self.assertEqual(snap['state']['accounts']['fixture-account']['streak'],0)
+    def test_http_errors_do_not_schedule_confirmation(self):
+        self.configure_monitor();self.host.http_status=429;self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertEqual(state['total_runs'],1);self.assertIsNone(state['confirm_due_ms']);self.assertEqual(state['streak'],0)
+    def test_cancelled_background_run_counts_once_and_stale_lease_resets_confirmation(self):
+        self.configure_monitor();self.host.stall_stream=True
+        self.due();call_id=self.host.next_id
+        self.host.on_stream=lambda:self.host.write({'type':'cancel','id':call_id})
+        self.assertEqual(self.host.call('plugin.reconcile',stage='maintenance')[0],'cancelled')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertEqual(state['total_runs'],1);self.assertIsNotNone(state['active'])
+        self.host.on_stream=None;self.host.stall_stream=False
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,1)
+        self.host.states['monitor']['value']['accounts']['fixture-account']['active']['started_ms']=0
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertIsNone(self.host.states['monitor']['value']['accounts']['fixture-account']['active'])
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.call('GET','monitor')[1]['total_runs'],2);self.assertEqual(self.host.disable_count,0)
     def test_probe_preserves_selected_model_with_host_identity(self):
         self.host.model_names=['gpt-6.1-sol','gpt-6-astra']
         for index,model in enumerate(self.host.model_names):
@@ -283,7 +470,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(status,400);self.assertEqual(self.host.export_count,0)
     def test_background_timeout_preserves_details_without_disabling(self):
         self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
-        self.host.stall_stream=True;self.due();started=time.monotonic()
+        self.host.stall_stream=True;self.due(confirmation=True);started=time.monotonic()
         self.host.call('plugin.reconcile',stage='maintenance')
         elapsed=time.monotonic()-started;self.assertGreaterEqual(elapsed,17);self.assertLess(elapsed,29)
         record=self.host.states['history']['value']['records'][-1]
@@ -305,32 +492,39 @@ class Integration(unittest.TestCase):
         s=self.host.states['monitor']['value']['accounts']['fixture-account'];self.assertEqual(s['streak'],1)
         # 同一到期时间只消费一次，维护回调重入不重发。
         self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(len(self.host.http),2)
-        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.host.disable_count,1);self.assertFalse(self.host.account_enabled)
         self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['action'],'disabled')
         self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(len(self.host.http),4)
         self.assertEqual(self.host.disable_count,1)
-    def test_manual_opt_in_and_failure_does_not_disable(self):
-        self.configure_monitor(scheduled=False)
-        self.run_request('fixture-monitor-1','probe');self.assertEqual(self.host.disable_count,0)
-        self.host.http_status=429
-        result=self.run_request('fixture-monitor-2','probe')[1]['record']
-        self.assertEqual(result['status'],'inconclusive');self.assertEqual(result['metrics']['rounds'][0]['http_status'],429)
-        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
+    def test_manual_probes_ignore_monitor_rules_and_never_disable(self):
+        self.configure_monitor(daily_max=1)
+        self.control(True)
+        self.run_request('fixture-monitor-1','probe');self.run_request('fixture-monitor-2','probe')
+        state=self.host.call('GET','monitor')[1]
+        self.assertEqual(state['total_runs'],0);self.assertEqual(state['daily_runs'],0)
         self.assertEqual(self.host.disable_count,0)
+        self.host.http_status=429
+        result=self.run_request('fixture-monitor-3','probe')[1]['record']
+        self.assertEqual(result['status'],'inconclusive');self.assertEqual(result['metrics']['rounds'][0]['http_status'],429)
+        self.assertNotIn('monitor',result['metrics'])
     def test_stale_settings_and_inflight_switch_off(self):
-        config=self.configure_monitor()
+        config=self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
         status,_=self.host.call('POST','monitor',{'settings':config['state']['settings'],'expected_generation':None});self.assertEqual(status,400)
-        self.run_request('fixture-toggle-1','probe')
         def change():
             state=self.host.states['monitor'];state['value']['generation']='different';state['value']['settings']['auto_disable']=False;state['version']+=1
         self.host.on_stream=change
-        self.run_request('fixture-toggle-2','probe');self.assertEqual(self.host.disable_count,0)
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,0)
     def test_disable_failure_keeps_unconfirmed_and_no_retry(self):
-        self.configure_monitor(scheduled=False);self.host.fail_disable=True
-        self.run_request('fixture-action-1','probe');result=self.run_request('fixture-action-2','probe')[1]['record']
+        self.configure_monitor();self.host.fail_disable=True
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        result=self.host.states['history']['value']['records'][-1]
         self.assertEqual(self.host.disable_count,1);self.assertEqual(result['metrics']['monitor']['action'],'unconfirmed')
-        self.run_request('fixture-action-3','probe');self.assertEqual(self.host.disable_count,1)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.disable_count,1)
     def test_safe_identity_and_preserved_history_name(self):
         self.host.account_notes='账号别称'
         self.assertEqual(self.host.call('GET','catalog')[1]['accounts'][0]['name'],'账号别称')
@@ -342,31 +536,25 @@ class Integration(unittest.TestCase):
         states=self.host.states
         self.host.close();self.host=Host();self.host.states=states
         self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(len(self.host.http),0)
-        self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.disable_count,1)
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.disable_count,1)
     def test_status_ticks_do_not_conflict_with_settings_edit(self):
         config=self.configure_monitor()
         self.host.call('plugin.reconcile',stage='maintenance')
         status,result=self.host.call('POST','monitor',{'settings':config['state']['settings'],'expected_generation':config['state']['generation']})
         self.assertEqual(status,200,result)
-    def test_healthy_and_interrupted_round_reset_streak(self):
-        self.configure_monitor(scheduled=False)
-        self.run_request('fixture-streak-1','probe')
+    def test_healthy_confirmation_resets_streak(self):
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
         self.host.ticket_second='ticket-first'
-        self.run_request('fixture-streak-2','probe')
-        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],0)
-        self.host.ticket_second='ticket-new'
-        self.run_request('fixture-streak-3','probe')
-        self.host.states['monitor']['value']['accounts']['fixture-account']['last_status']='running'
-        self.run_request('fixture-streak-4','probe')
-        self.assertEqual(self.host.disable_count,0)
-        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['streak'],1)
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
+        state=self.host.states['monitor']['value']['accounts']['fixture-account']
+        self.assertEqual(state['streak'],0);self.assertIsNone(state['confirm_due_ms']);self.assertEqual(self.host.disable_count,0)
     def test_manually_restored_account_starts_new_cycle(self):
-        self.configure_monitor(scheduled=False)
-        self.run_request('fixture-restore-1','probe');self.run_request('fixture-restore-2','probe')
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.host.disable_count,1)
         self.host.account_enabled=True
-        self.run_request('fixture-restore-3','probe');self.assertEqual(self.host.disable_count,1)
-        self.run_request('fixture-restore-4','probe');self.assertEqual(self.host.disable_count,2)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.disable_count,1)
+        self.due(confirmation=True);self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.disable_count,2)
     def test_probe_details_cover_both_rounds_without_secrets(self):
         r=self.run_request('fixture-details','probe')[1]['record']
         rounds=r['metrics']['rounds'];self.assertEqual(len(rounds),2)

@@ -25,6 +25,7 @@ fn registration() -> ManagementRegistration {
             ("POST", "run"),
             ("GET", "monitor"),
             ("POST", "monitor"),
+            ("POST", "monitor/control"),
         ]
         .into_iter()
         .map(|(method, path)| ManagementRoute {

@@ -270,22 +270,14 @@ impl App {
                 let request: monitor::Save = decode(&call.payload)?;
                 json_response(200, &self.monitor.save(host, request).await?)
             }
+            ("POST", "monitor/control") => {
+                let request: monitor::Control = decode(&call.payload)?;
+                json_response(200, &self.monitor.control(host, request).await?)
+            }
             ("POST", "run") => {
                 let request: RunRequest = decode(&call.payload)?;
                 request.validate()?;
-                let generation = if request.mode == "probe" {
-                    self.monitor
-                        .generation(
-                            host,
-                            &request.account_id,
-                            &request.model,
-                            request.client_key_id.as_deref().unwrap_or_default(),
-                        )
-                        .await?
-                } else {
-                    None
-                };
-                self.run(host, request, 90, generation, false).await
+                self.run(host, request, 90, None, false).await
             }
             _ => json_response(404, &json!({"error":"请求未注册"})),
         }
@@ -320,15 +312,6 @@ impl App {
             let (history, _) = store::get::<History>(host, "history").await?;
             if let Some(record) = history.records.iter().find(|r| r.id == request.id) {
                 return json_response(200, &json!({"record":record,"replayed":true}));
-            }
-        }
-        if let Some(generation) = &monitor_generation {
-            let current = self
-                .monitor
-                .begin(host, &request.account_id, generation)
-                .await?;
-            if scheduled && !current {
-                return Err("计划已变更，本轮未执行".into());
             }
         }
         let account: AuthRuntimeAccount = payload_call(
@@ -405,6 +388,11 @@ impl App {
                     && started.saturating_sub(r.started_at_ms) < 150_000
             }) {
                 return Err("该账号有未确认测试，请稍后查询历史".into());
+            }
+            if let Some(generation) = &monitor_generation
+                && !self.monitor.begin(host, &request, generation).await?
+            {
+                return Err("监控已暂停、设置变更或触及时间与次数限制，本轮未执行".into());
             }
             history.append(record.clone())?;
             store::put(host, "history", &history, version).await?;
