@@ -7,6 +7,7 @@ import socketserver
 import ssl
 import tempfile
 import threading
+import uuid
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -65,6 +66,14 @@ class ProxyFixture:
                         assert body['stream'] is True
                         assert headers['authorization']=='Bearer fixture-token-not-real'
                         assert headers['chatgpt-account-id']=='fixture-upstream'
+                        profile=owner.identity_snapshots[-1]
+                        assert headers['originator']==profile['originator']
+                        assert headers['version']==profile['codexVersion']
+                        assert headers['user-agent']==profile['userAgent']
+                        assert 'session_id' not in headers and 'openai-beta' not in headers
+                        uuid.UUID(headers['session-id']);uuid.UUID(headers['x-client-request-id'])
+                        assert headers['x-codex-routing-hint']=='model='+body['model']
+                        assert body=={'model':body['model'],'instructions':'Reply with OK.','input':[{'type':'message','role':'user','content':[{'type':'input_text','text':'Reply with OK.'}]}],'stream':True,'store':False,'parallel_tool_calls':True,'include':['reasoning.encrypted_content']}
                         fixture.requests.append(headers)
                         if owner.on_stream:owner.on_stream()
                         if owner.stall_stream:

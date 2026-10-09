@@ -1,5 +1,9 @@
 use crate::{proxy_transport, store::now_ms};
-use gateway_plugin_sdk::{call::host::AuthRuntimeAccount, client::HostClient};
+use gateway_plugin_sdk::{
+    call::{host::AuthRuntimeAccount, services::settings::PreviewClientProfile},
+    client::HostClient,
+};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -99,6 +103,12 @@ async fn execute(
     rounds: &mut Vec<Round>,
 ) -> Result<ProbeResult, String> {
     eligibility(account).map_err(str::to_owned)?;
+    // 两轮冻结同一份全局画像，下次探针再读取，不复制宿主的版本解析或默认值。
+    let profile = host
+        .service::<PreviewClientProfile>(("openai".into(), None))
+        .await
+        .map_err(|_| "宿主OpenAI客户端身份读取失败，未发送探针")?;
+    let mut headers = identity_headers(&profile)?;
     let connection = proxy_transport::connection(
         host,
         &account.account_id,
@@ -109,22 +119,22 @@ async fn execute(
     )
     .await?;
     let client = &connection.client;
-    let token = connection.token.as_str();
-    let account_id = connection.upstream_id.as_str();
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", connection.token))
+        .map_err(|_| "账号访问令牌无法用于请求头，未发送探针")?;
+    authorization.set_sensitive(true);
+    headers.insert("authorization", authorization);
+    headers.insert(
+        "chatgpt-account-id",
+        HeaderValue::from_str(&connection.upstream_id)
+            .map_err(|_| "账号上游标识无法用于请求头，未发送探针")?,
+    );
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert("accept", HeaderValue::from_static("text/event-stream"));
     rounds.push(Round {
         phase: "首轮获取门票".into(),
         ..Round::default()
     });
-    let first = measured_shot(
-        client,
-        token,
-        account_id,
-        model,
-        "",
-        &[],
-        rounds.last_mut().unwrap(),
-    )
-    .await?;
+    let first = measured_shot(client, &headers, model, "", &[], rounds.last_mut().unwrap()).await?;
     if first.ticket.is_empty() {
         return Ok(ProbeResult {
             status: "inconclusive".into(),
@@ -138,8 +148,7 @@ async fn execute(
     });
     let second = measured_shot(
         client,
-        token,
-        account_id,
+        &headers,
         model,
         &first.ticket,
         &first.cookies,
@@ -160,14 +169,33 @@ async fn execute(
     })
 }
 
+fn identity_headers(profile: &serde_json::Map<String, Value>) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    for (name, field) in [
+        ("originator", "originator"),
+        ("version", "codexVersion"),
+        ("user-agent", "userAgent"),
+    ] {
+        let value = profile
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.len() <= 4096)
+            .ok_or("宿主OpenAI客户端身份字段无效，未发送探针")?;
+        headers.insert(
+            name,
+            HeaderValue::from_str(value).map_err(|_| "宿主OpenAI客户端身份头无效，未发送探针")?,
+        );
+    }
+    Ok(headers)
+}
+
 fn new_ticket(first: &str, second: &str) -> bool {
     !second.is_empty() && second != first
 }
 
 async fn measured_shot(
     client: &reqwest::Client,
-    token: &str,
-    account_id: &str,
+    headers: &HeaderMap,
     model: &str,
     ticket: &str,
     cookies: &[String],
@@ -175,7 +203,7 @@ async fn measured_shot(
 ) -> Result<Shot, String> {
     let start = Instant::now();
     round.started = Some(start);
-    let result = shot(client, token, account_id, model, ticket, cookies, round).await;
+    let result = shot(client, headers, model, ticket, cookies, round).await;
     round.elapsed_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     if let Err(error) = &result {
         round.error = Some(error.clone());
@@ -185,42 +213,26 @@ async fn measured_shot(
 
 async fn shot(
     client: &reqwest::Client,
-    token: &str,
-    account_id: &str,
+    headers: &HeaderMap,
     model: &str,
     ticket: &str,
     cookies: &[String],
     round: &mut Round,
 ) -> Result<Shot, String> {
-    let mut headers: Vec<(String, String)> = vec![
-        ("authorization".into(), format!("Bearer {token}")),
-        ("chatgpt-account-id".into(), account_id.into()),
-        ("content-type".into(), "application/json".into()),
-        ("accept".into(), "text/event-stream".into()),
-        ("openai-beta".into(), "responses=experimental".into()),
-        ("originator".into(), "codex_cli_rs".into()),
-        (
-            "user-agent".into(),
-            concat!(
-                "codex_cli_rs/0.155.0 (Linux; x86_64) model-quality-test/",
-                env!("CARGO_PKG_VERSION")
-            )
-            .into(),
-        ),
-        ("version".into(), "0.155.0".into()),
-        ("session_id".into(), uuid::Uuid::new_v4().to_string()),
-    ];
+    // HTTP路径与宿主保持同名会话和路由头，每轮使用新的会话，不附加插件身份后缀。
+    let mut request = client
+        .post(ENDPOINT)
+        .headers(headers.clone())
+        .header("session-id", uuid::Uuid::new_v4().to_string())
+        .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
+        .header("x-codex-routing-hint", format!("model={model}"));
     if !ticket.is_empty() {
-        headers.push(("x-codex-turn-state".into(), ticket.into()));
+        request = request.header("x-codex-turn-state", ticket);
     }
     if !cookies.is_empty() {
-        headers.push(("cookie".into(), cookies.join("; ")));
+        request = request.header("cookie", cookies.join("; "));
     }
     let body = json!({"model":model,"instructions":"Reply with OK.","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with OK."}]}],"stream":true,"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"]});
-    let mut request = client.post(ENDPOINT);
-    for (name, value) in headers {
-        request = request.header(name, value);
-    }
     let mut response = request
         .body(serde_json::to_vec(&body).map_err(|_| "探针正文编码失败")?)
         .send()

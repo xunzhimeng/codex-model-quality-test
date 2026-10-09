@@ -33,10 +33,14 @@ class Host:
         self.key_groups=[]
         self.group_enabled=True
         self.model_visible=True
+        self.model_names=['fixture-model']
         self.proxy_configured=True
         self.export_id='fixture-account'
         self.export_count=0
         self.model_policy={'mode':'all','models':[]}
+        self.client_profile={'originator':'Codex Desktop','codexVersion':'0.153.4','userAgent':'Codex Desktop/0.153.4 (Mac OS 15.7.1; arm64) unknown (Codex Desktop; 26.901.51231)'}
+        self.profile_error=False
+        self.identity_snapshots=[]
         self.process = subprocess.Popen([str(ROOT/'target/debug'/('model-quality-test.exe' if os.name=='nt' else 'model-quality-test'))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,env={**os.environ,'SSL_CERT_FILE':str(self.proxy.ca_path)})
         self.messages = queue.Queue()
         self.states = {}
@@ -96,7 +100,14 @@ class Host:
             result={'keys':[{'id':'fixture-key','name':'测试Key','enabled':True}],'next_cursor':None}
         elif method=='host.models.list':
             assert not body; assert params['client_key_id']=='fixture-key'
-            result={'models':['fixture-model'] if self.model_visible else []}
+            result={'models':self.model_names if self.model_visible else []}
+        elif method=='host.services.call':
+            assert not body and params=={'operation':'settings.preview_client_profile','input':['openai',None]}
+            if self.profile_error:
+                result={'Err':{'kind':'unavailable','message':'fixture-profile-secret'}}
+            else:
+                self.identity_snapshots.append(dict(self.client_profile))
+                result={'Ok':self.client_profile}
         elif method=='host.state.get':
             assert not body; assert params['namespace']=='quality'
             result={'record':self.states.get(params['key'])}
@@ -177,8 +188,8 @@ class Host:
 class Integration(unittest.TestCase):
     def setUp(self): self.host=Host()
     def tearDown(self): self.host.close()
-    def run_request(self,id,mode='question'):
-        return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':'fixture-model','effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key','question_id':'candy' if mode=='question' else None})
+    def run_request(self,id,mode='question',model='fixture-model'):
+        return self.host.call('POST','run',{'id':id,'batch_id':'fixture-batch','account_id':'fixture-account','mode':mode,'model':model,'effort':'medium' if mode=='question' else 'default','client_key_id':'fixture-key','question_id':'candy' if mode=='question' else None})
     def configure_monitor(self,scheduled=True,auto_disable=True):
         snapshot=self.host.call('GET','monitor')[1]
         status,result=self.host.call('POST','monitor',{'settings':{'scheduled':scheduled,'auto_disable':auto_disable,'interval_minutes':30,'model':'fixture-model','client_key_id':'fixture-key','account_ids':['fixture-account']},'expected_generation':snapshot['state']['generation'] or None})
@@ -187,6 +198,50 @@ class Integration(unittest.TestCase):
     def due(self):
         state=self.host.states['monitor']['value']
         state['accounts']['fixture-account']['next_due_ms']=0
+    def test_probe_preserves_selected_model_with_host_identity(self):
+        self.host.model_names=['gpt-6.1-sol','gpt-6-astra']
+        for index,model in enumerate(self.host.model_names):
+            status,result=self.run_request(f'fixture-selected-model-{index}','probe',model)
+            self.assertEqual(status,200,result)
+            self.assertEqual(result['record']['model'],model)
+            for headers in self.host.http[index*2:index*2+2]:
+                self.assertEqual(headers['x-codex-routing-hint'],'model='+model)
+                self.assertEqual(headers['user-agent'],self.host.client_profile['userAgent'])
+        self.assertEqual(self.host.proxy.connects,4)
+    def test_probe_identity_is_frozen_per_run_and_reloaded_next_run(self):
+        first_profile=dict(self.host.client_profile)
+        def change_profile():
+            self.host.client_profile={'originator':'codex_cli_rs','codexVersion':'0.155.0','userAgent':'codex_cli_rs/0.155.0 (Linux 6.8; x86_64) xterm-256color'}
+        self.host.on_stream=change_profile
+        self.assertEqual(self.run_request('fixture-profile-first','probe')[0],200)
+        self.assertEqual(len(self.host.identity_snapshots),1)
+        self.assertEqual(self.host.http[0]['user-agent'],first_profile['userAgent'])
+        self.assertEqual(self.host.http[1]['user-agent'],first_profile['userAgent'])
+        self.assertNotEqual(self.host.http[0]['session-id'],self.host.http[1]['session-id'])
+        self.assertNotEqual(self.host.http[0]['x-client-request-id'],self.host.http[1]['x-client-request-id'])
+        self.host.on_stream=None
+        self.assertEqual(self.run_request('fixture-profile-next','probe')[0],200)
+        self.assertEqual(len(self.host.identity_snapshots),2)
+        self.assertEqual(self.host.http[2]['user-agent'],self.host.client_profile['userAgent'])
+        self.assertEqual(self.host.http[3]['version'],'0.155.0')
+        state=dump(self.host.states).decode()
+        self.assertNotIn(first_profile['userAgent'],state)
+        self.assertNotIn(self.host.client_profile['userAgent'],state)
+    def test_unavailable_or_invalid_identity_stops_before_export_and_network(self):
+        self.host.profile_error=True
+        result=self.run_request('fixture-profile-unavailable','probe')[1]['record']
+        self.assertEqual(result['status'],'inconclusive');self.assertIn('客户端身份读取失败',result['detail'])
+        self.assertNotIn('fixture-profile-secret',dump(self.host.states).decode())
+        self.host.profile_error=False
+        for index,(field,value) in enumerate([('originator',''),('codexVersion',None),('userAgent','bad\r\nfixture-profile-secret')]):
+            original=self.host.client_profile[field];self.host.client_profile[field]=value
+            result=self.run_request(f'fixture-profile-invalid-{index}','probe')[1]['record']
+            self.assertEqual(result['status'],'inconclusive')
+            self.assertIn('客户端身份',result['detail'])
+            self.host.client_profile[field]=original
+        self.assertEqual(self.host.export_count,0);self.assertEqual(self.host.proxy.connects,0)
+        self.assertNotIn('fixture-profile-secret',dump(self.host.states).decode())
+        self.assertEqual(self.run_request('fixture-profile-recovered','probe')[0],200)
     def test_key_and_scope_failures_do_not_export_credentials(self):
         for field,value in [('key_enabled',False),('model_visible',False),('key_groups',['other-group'])]:
             with self.subTest(field=field):
