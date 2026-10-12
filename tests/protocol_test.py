@@ -48,6 +48,7 @@ class Host:
         self.streams = {}
         self.http = self.proxy.requests
         self.ticket_second = 'ticket-new'
+        self.model_answer = '21'
         self.bad_stream = False
         self.model_count = 0
         self.account_enabled = True
@@ -58,6 +59,7 @@ class Host:
         self.error_body = None
         self.fail_disable = False
         self.body_streams = {}
+        self.state_metadata_sizes = []
         self.on_stream = None
         self.on_account_read = None
         self.stall_stream = False
@@ -73,6 +75,7 @@ class Host:
         assert all(path and not path.startswith('/') for _, path in self.routes)
     def write(self, metadata, payload=b''):
         data=dump(metadata)
+        assert 0 < len(data) <= 65536, 'Host RPC metadata exceeds 64KiB'
         self.process.stdin.write(struct.pack('>IQ',len(data),len(payload))+data+payload)
         self.process.stdin.flush()
     def reader(self):
@@ -86,6 +89,7 @@ class Host:
         except Exception as error: self.messages.put(({'type':'reader_error','error':str(error)},b''))
     def callback(self, msg, body):
         method=msg['method']; params=msg['params']; self.calls.append(method)
+        assert len(dump(msg)) <= 65536, 'SDK RPC metadata exceeds 64KiB'
         result={}; payload=b''
         account={'account_id':'fixture-account','provider_id':'openai','credential_revision':1,'name':'OpenAI 账号','email':'fixture@example.test','upstream_user_id':None,'upstream_account_id':'fixture-upstream','plan_type':'plus','authentication_kind':'oauth','enabled':self.account_enabled,'credential_state':'ready','has_refresh_token':False,'access_token_expires_at_ms':None,'next_refresh_at_ms':None}
         if method.startswith('host.auth.'):
@@ -117,6 +121,8 @@ class Host:
         elif method=='host.state.put':
             assert not body; key=params['key']; old=self.states.get(key)
             assert params['expected_version']==(old['version'] if old else None)
+            self.state_metadata_sizes.append(len(dump(msg)))
+            assert len(dump(msg)) <= 60*1024
             assert len(dump(params['value']))<262144
             version=(old['version']+1) if old else 1
             self.states[key]={'value':params['value'],'version':version,'schema_version':1}; result={'version':version}
@@ -125,7 +131,7 @@ class Host:
             assert json.loads(body)['reasoning']['effort']=='medium'
             assert self.states['history']['value']['records'][-1]['status']=='running'
             self.model_count+=1
-            result={'request_id':'fixture-request','events':1}; payload=events()
+            result={'request_id':'fixture-request','events':1}; payload=events(self.model_answer)
         elif method=='host.http.dispatch':
             from urllib.parse import urlsplit,parse_qs
             assert params['settings'] is None
@@ -207,6 +213,80 @@ class Integration(unittest.TestCase):
     def control(self,paused,account_id=None,snapshot=None):
         state=(snapshot or self.host.call('GET','monitor')[1])['state']
         return self.host.call('POST','monitor/control',{'paused':paused,'account_id':account_id,'expected_generation':state['generation'],'expected_control_revision':state['control_revision']})
+    def seed_near_limit_history(self,size):
+        import copy
+        base=self.run_request('fixture-seed','probe')[1]['record']
+        records=[]
+        for i in range(40):
+            record=copy.deepcopy(base);record['id']=f'fixture-history-{i}';records.append(record)
+        history={'records':records,'evicted':0}
+        gap=size-len(dump(history));self.assertGreater(gap,0)
+        history['records'][0]['detail']+='x'*gap
+        self.assertEqual(len(dump(history)),size)
+        self.host.states['history']['value']=history
+    def test_legacy_65287_history_allows_new_probe_and_persistent_result(self):
+        self.seed_near_limit_history(65287)
+        before=self.host.proxy.connects
+        status,result=self.run_request('fixture-frame-recovery','probe')
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'degraded')
+        self.assertEqual(self.host.proxy.connects,before+2)
+        history=self.host.call('GET','history')[1]
+        self.assertGreater(history['evicted'],0)
+        self.assertEqual(history['records'][-1]['id'],'fixture-frame-recovery')
+        self.assertNotEqual(history['records'][-1]['status'],'running')
+        self.assertLess(len(dump(history)),60*1024)
+        self.assertTrue(self.run_request('fixture-frame-recovery','probe')[1]['replayed'])
+        self.assertEqual(self.host.proxy.connects,before+2)
+    def test_completion_capacity_growth_does_not_leave_running(self):
+        self.seed_near_limit_history(64299)
+        status,result=self.run_request('fixture-frame-completion','probe')
+        self.assertEqual(status,200,result)
+        history=self.host.call('GET','history')[1]
+        self.assertEqual(history['records'][-1]['status'],'degraded')
+        self.assertIsNotNone(history['records'][-1]['finished_at_ms'])
+        self.assertTrue(all(size<=60*1024 for size in self.host.state_metadata_sizes))
+    def test_many_probe_results_never_cross_metadata_budget(self):
+        for i in range(60):
+            status,result=self.run_request(f'fixture-growth-{i}','probe')
+            self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'degraded')
+        history=self.host.call('GET','history')[1]
+        self.assertGreater(history['evicted'],0)
+        self.assertEqual(len(history['records'])+history['evicted'],60)
+        self.assertTrue(all(r['status']!='running' for r in history['records']))
+        self.assertEqual(self.host.proxy.connects,120)
+    def test_unconfirmed_legacy_records_are_not_fabricated_or_replayed(self):
+        self.seed_near_limit_history(65287)
+        history=self.host.states['history']['value']
+        pending=history['records'][-1];pending['id']='fixture-old-unconfirmed';pending['status']='running'
+        pending['started_at_ms']=int(time.time()*1000)-180000
+        pending['finished_at_ms']=None;pending['latency_ms']=None
+        before=self.host.proxy.connects
+        result=self.run_request('fixture-old-unconfirmed','probe')[1]
+        self.assertTrue(result['replayed']);self.assertEqual(result['record']['status'],'running')
+        self.assertEqual(self.host.proxy.connects,before)
+        self.assertEqual(self.run_request('fixture-new-after-old','probe')[0],200)
+        existing=next((r for r in self.host.call('GET','history')[1]['records'] if r['id']=='fixture-old-unconfirmed'),None)
+        if existing:self.assertEqual(existing['status'],'running');self.assertIsNone(existing['finished_at_ms'])
+    def test_large_escaped_answer_records_capacity_failure_not_running(self):
+        question={'id':'custom_escaped','title':'容量边界','category':'测试','prompt':'\0'*7999,'answer':'1'}
+        self.assertEqual(self.host.call('POST','questions',{'questions':[question],'expected_version':None})[0],200)
+        self.host.model_answer='\0'*8192
+        request={'id':'fixture-large-answer','batch_id':'fixture-batch','account_id':'fixture-account','mode':'question','model':'fixture-model','effort':'medium','client_key_id':'fixture-key','question_id':question['id']}
+        status,result=self.host.call('POST','run',request)
+        self.assertEqual(status,200,result)
+        record=result['record']
+        self.assertEqual(record['status'],'failed');self.assertEqual(record['metrics']['storage_error'],'result_too_large')
+        self.assertIsNone(record['answer']);self.assertIsNotNone(record['finished_at_ms'])
+        self.assertEqual(self.host.states['history']['value']['records'][-1]['status'],'failed')
+        self.assertTrue(self.host.call('POST','run',request)[1]['replayed']);self.assertEqual(self.host.model_count,1)
+    def test_bank_transport_limit_rejects_before_state_write(self):
+        bank=[{'id':f'custom_large_{i}','title':'题目','category':'数学','prompt':'x'*7999,'answer':'1'} for i in range(9)]
+        status,result=self.host.call('POST','questions',{'questions':bank,'expected_version':None})
+        self.assertEqual(status,400,result);self.assertIn('60KiB',result['error'])
+        self.assertNotIn('bank',self.host.states)
+        bank=bank[:6]
+        self.assertEqual(self.host.call('POST','questions',{'questions':bank,'expected_version':None})[0],200)
+        self.assertEqual(len([q for q in self.host.call('GET','catalog')[1]['questions'] if q['id'].startswith('custom_')]),6)
     def test_immediate_policy_disables_on_first_degraded_without_confirmation(self):
         self.configure_monitor(degradation_policy='immediate',daily_max=1)
         self.due();self.host.call('plugin.reconcile',stage='maintenance')

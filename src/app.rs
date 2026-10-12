@@ -389,12 +389,12 @@ impl App {
             }) {
                 return Err("该账号有未确认测试，请稍后查询历史".into());
             }
+            history.append(record.clone())?;
             if let Some(generation) = &monitor_generation
                 && !self.monitor.begin(host, &request, generation).await?
             {
                 return Err("监控已暂停、设置变更或触及时间与次数限制，本轮未执行".into());
             }
-            history.append(record.clone())?;
             store::put(host, "history", &history, version).await?;
         }
         let mut pending = PendingAccount {
@@ -441,6 +441,12 @@ impl App {
         }
         record.metrics["client_key_id"] = json!(request.client_key_id);
         record.metrics["source"] = json!(if scheduled { "scheduled" } else { "manual" });
+        // 先检查结果容量，不在监控停用的宿主回调期间持有历史锁。
+        record = {
+            let _guard = self.history.lock().await;
+            let (mut history, _) = store::get::<History>(host, "history").await?;
+            history.finish(record, now_ms())?
+        };
         if let Some(generation) = monitor_generation
             && let Err(error) = self.monitor.observe(host, &mut record, &generation).await
         {
@@ -448,12 +454,7 @@ impl App {
         }
         let _guard = self.history.lock().await;
         let (mut history, version) = store::get::<History>(host, "history").await?;
-        let existing = history
-            .records
-            .iter_mut()
-            .find(|r| r.id == request.id)
-            .ok_or("测试记录丢失，结果未保存")?;
-        *existing = record.clone();
+        record = history.finish(record, now_ms())?;
         store::put(host, "history", &history, version).await?;
         json_response(200, &json!({"record":record,"replayed":false}))
     }

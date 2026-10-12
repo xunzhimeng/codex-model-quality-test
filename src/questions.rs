@@ -51,12 +51,12 @@ pub fn validate_custom(questions: &[Question]) -> Result<(), &'static str> {
             }
         }
     }
-    if serde_json::to_vec(questions)
+    // 题库也作为state回调元数据发送，不能按数据库256KiB值上限估算。
+    if crate::store::state_metadata_bytes("bank", &serde_json::json!({"questions":questions}))
         .map_err(|_| "题库编码失败")?
-        .len()
-        > 240_000
+        > crate::store::STATE_FRAME_BUDGET
     {
-        return Err("自定义题库超过240KB容量限制");
+        return Err("自定义题库超过60KiB通信预算");
     }
     Ok(())
 }

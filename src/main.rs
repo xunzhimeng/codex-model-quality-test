@@ -110,12 +110,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     #[test]
-    fn targets_cpr_3_21_patch_contract() {
+    fn retains_minimum_host_version_without_upper_bound() {
         let source: serde_json::Value =
             serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
         assert_eq!(source["manifestVersion"], 2);
         assert!(source.get("permissions").is_none());
-        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.21.1, <3.22.0");
+        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.21.1");
         assert_eq!(source["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 2);
     }

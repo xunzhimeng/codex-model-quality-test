@@ -146,7 +146,7 @@ onMounted(reload)
     <MonitorPanel v-if="tab === 'monitor'" :accounts="catalog.accounts" :keys="catalog.keys" />
     <section v-if="tab === 'bank'" class="panel">
       <div class="section-head"><strong>自定义题库</strong><button class="primary" :disabled="bankSaving" @click="saveBank">{{ bankSaving ? '正在保存' : '保存题库' }}</button></div>
-      <p class="muted">最多30道，每题包含 id、title、category、prompt、answer，ID以 custom_ 开头</p>
+      <p class="muted">最多30道，并受60KiB状态通信预算限制，每题包含 id、title、category、prompt、answer，ID以 custom_ 开头</p>
       <details><summary>查看格式示例</summary><pre>[{"id":"custom_sum","title":"加法","category":"数学","prompt":"17加28等于多少？只输出整数","answer":"45"}]</pre></details>
       <label class="editor-label">题库JSON<textarea v-model="customJson" spellcheck="false" rows="16" /></label>
     </section>
@@ -157,7 +157,7 @@ onMounted(reload)
       </section>
       <section class="panel">
         <div class="section-head"><strong>{{ tab === 'history' ? '测试记录' : '本批次结果' }}</strong><div class="inline"><button :disabled="!displayedRecords.length" @click="download('json')">导出JSON</button><button :disabled="!displayedRecords.length" @click="download('csv')">导出CSV</button></div></div>
-        <p v-if="tab === 'history'" class="muted">最多保留100项，并受195KB容量限制{{ evicted ? `，累计移出 ${evicted} 项，请及时导出` : '' }}</p>
+        <p v-if="tab === 'history'" class="muted">最多保留100项，按60KiB消息帧预算自动移出最早非在途记录{{ evicted ? `，累计移出 ${evicted} 项，请及时导出` : '' }}</p>
         <div v-if="displayedRecords.length" class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>题目 / 探针</th><th>模型</th><th>结果</th><th>耗时</th><th>操作</th></tr></thead><tbody><tr v-for="r in displayedRecords" :key="r.id"><td class="nowrap">{{ time(r.started_at_ms) }}</td><td>{{ accountName(r.account_id, r.account_name) }}</td><td>{{ r.question_title || '门票探针' }}</td><td>{{ r.model }}<small v-if="r.mode === 'question'">{{ r.effort }}</small></td><td><span class="badge" :class="r.status">{{ label(r.status) }}</span></td><td class="nowrap">{{ seconds(r.latency_ms) }}</td><td><button class="text-button" @click="current = r">详情</button></td></tr></tbody></table></div>
         <p v-else class="empty">{{ loading ? '正在加载' : '暂无测试结果' }}</p>
       </section>
