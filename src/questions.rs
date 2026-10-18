@@ -51,7 +51,7 @@ pub fn validate_custom(questions: &[Question]) -> Result<(), &'static str> {
             }
         }
     }
-    // 题库也作为state回调元数据发送，不能按数据库256KiB值上限估算。
+    // 题库通过state业务JSON前缀发送，沿用保守预算，不按数据库256KiB值上限估算。
     if crate::store::state_metadata_bytes("bank", &serde_json::json!({"questions":questions}))
         .map_err(|_| "题库编码失败")?
         > crate::store::STATE_FRAME_BUDGET

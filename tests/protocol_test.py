@@ -25,6 +25,38 @@ def events(answer='21'):
     event = b'GPE2' + struct.pack('>III', len(metadata), 0, 0) + metadata
     return b'HME1' + struct.pack('>II', 1, len(event)) + event
 
+def frame_bytes(message,payload=b''):
+    # 协议4将配置、业务JSON和入口快照移到独立payload前缀，不能只改握手版本。
+    import copy
+    message=copy.deepcopy(message);prefix=b''
+    if message['type']=='call':
+        context=message['context']
+        snapshot=context.pop('request',None)
+        if snapshot is not None:
+            request=dump(snapshot);message['request_context_bytes']=len(request);prefix+=request
+    key={'hello':'configuration','call':'params','callback':'params','result':'result'}.get(message['type'])
+    if key is not None:
+        owner=message['handshake'] if message['type']=='hello' else message
+        data=dump(owner.pop(key));message['data_bytes']=len(data);prefix+=data
+    metadata=dump(message)
+    assert 0<len(metadata)<=65536
+    return struct.pack('>IQ',len(metadata),len(prefix)+len(payload))+metadata+prefix+payload
+
+def read_frame(stream):
+    header=stream.read(12)
+    if not header:return None
+    m,b=struct.unpack('>IQ',header);assert 0<m<=65536
+    metadata=stream.read(m);message=json.loads(metadata);body=stream.read(b)
+    request_bytes=message.pop('request_context_bytes',0);data_bytes=message.pop('data_bytes',0)
+    assert request_bytes+data_bytes<=len(body)
+    if request_bytes:message['context']['request']=json.loads(body[:request_bytes])
+    key={'hello':'configuration','call':'params','callback':'params','result':'result'}.get(message['type'])
+    assert (key is not None)==(data_bytes>0)
+    if key:
+        owner=message['handshake'] if message['type']=='hello' else message
+        owner[key]=json.loads(body[request_bytes:request_bytes+data_bytes])
+    return message,body[request_bytes+data_bytes:]
+
 class Host:
     def __init__(self):
         self.proxy=ProxyFixture(self)
@@ -63,10 +95,10 @@ class Host:
         self.on_stream = None
         self.on_account_read = None
         self.stall_stream = False
-        self.write({'type':'hello','handshake':{'protocol_version':2,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':1,'stages':['management']}}}})
+        self.write({'type':'hello','handshake':{'protocol_version':4,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
         message,_ = self.messages.get(timeout=5)
-        assert message['type'] == 'ready' and message['protocol_version'] == 2, message
+        assert message['type'] == 'ready' and message['protocol_version'] == 4, message
         self.next_id = 11
         self.registration = self.call('management.register', stage='registration')
         # 先检查相对路由，再按注册表分发，避免桩直接接受宿主会拒绝的路径。
@@ -74,22 +106,18 @@ class Host:
         assert len(self.routes) == len(self.registration['routes'])
         assert all(path and not path.startswith('/') for _, path in self.routes)
     def write(self, metadata, payload=b''):
-        data=dump(metadata)
-        assert 0 < len(data) <= 65536, 'Host RPC metadata exceeds 64KiB'
-        self.process.stdin.write(struct.pack('>IQ',len(data),len(payload))+data+payload)
+        self.process.stdin.write(frame_bytes(metadata,payload))
         self.process.stdin.flush()
     def reader(self):
         try:
             while True:
-                header=self.process.stdout.read(12)
-                if not header: return
-                m,b=struct.unpack('>IQ',header)
-                message=json.loads(self.process.stdout.read(m)); payload=self.process.stdout.read(b)
-                self.messages.put((message,payload))
+                frame=read_frame(self.process.stdout)
+                if frame is None:return
+                self.messages.put(frame)
         except Exception as error: self.messages.put(({'type':'reader_error','error':str(error)},b''))
     def callback(self, msg, body):
         method=msg['method']; params=msg['params']; self.calls.append(method)
-        assert len(dump(msg)) <= 65536, 'SDK RPC metadata exceeds 64KiB'
+        # 解码后的业务JSON可超过64KiB；控制元数据上限由read_frame独立检查。
         result={}; payload=b''
         account={'account_id':'fixture-account','provider_id':'openai','credential_revision':1,'name':'OpenAI 账号','email':'fixture@example.test','upstream_user_id':None,'upstream_account_id':'fixture-upstream','plan_type':'plus','authentication_kind':'oauth','enabled':self.account_enabled,'credential_state':'ready','has_refresh_token':False,'access_token_expires_at_ms':None,'next_refresh_at_ms':None}
         if method.startswith('host.auth.'):
@@ -642,6 +670,35 @@ class Integration(unittest.TestCase):
         self.assertTrue(all(x['response_bytes']>0 and x['routing_cookie_count']==1 for x in rounds))
         self.assertNotIn('ticket-first',dump(r).decode())
         self.assertNotIn('fixture-token-not-real',dump(r).decode())
+    def test_v041_state_is_reused_without_reset_or_reexecution(self):
+        import copy
+        original=self.run_request('fixture-v041-history','probe')[1]['record']
+        bank=[{'id':'custom_kept','title':'保留题库','category':'数学','prompt':'1加1','answer':'2'}]
+        self.host.call('POST','questions',{'questions':bank,'expected_version':None})
+        self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.control(True,'fixture-account');self.control(True)
+        old=copy.deepcopy(self.host.states)
+        # v0.4.1与v0.5.0的namespace/schema/value结构保持一致，重启后只读取。
+        self.host.close();self.host=Host();self.host.states=copy.deepcopy(old)
+        history=self.host.call('GET','history')[1]
+        self.assertTrue(any(r['id']==original['id'] for r in history['records']))
+        self.assertTrue(any(q['id']=='custom_kept' for q in self.host.call('GET','catalog')[1]['questions']))
+        snap=self.host.call('GET','monitor')[1]
+        self.assertEqual(snap['state']['generation'],old['monitor']['value']['generation'])
+        self.assertTrue(snap['state']['paused']);self.assertTrue(snap['state']['accounts']['fixture-account']['paused'])
+        self.assertEqual(snap['total_runs'],1)
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.proxy.connects,0);self.assertEqual(self.host.export_count,0)
+        self.assertEqual(self.host.states['history'],old['history'])
+        self.assertEqual(self.host.states['bank'],old['bank'])
+        self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['total_runs'],1)
+    def test_protocol_four_large_business_input_and_payload_remain_separate(self):
+        bank=[{'id':f'custom_frame_{i}','title':'协议四','category':'数学','prompt':'x'*7999,'answer':'1'} for i in range(9)]
+        status,result=self.host.call('POST','questions',{'questions':bank,'expected_version':None})
+        self.assertEqual(status,400,result)
+        self.assertIn('60KiB',result['error'])
+        self.assertNotIn('bank',self.host.states)
+        self.assertEqual(self.host.call('GET','history')[0],200)
     def test_registration_catalog_model_and_persistent_replay(self):
         with self.assertRaises(AssertionError):
             self.host.call('GET', '/catalog')

@@ -60,7 +60,7 @@ pub async fn get<T: DeserializeOwned + Default>(
     }
 }
 
-// 私有状态走RPC元数据而不是payload；为64KiB合同及读回封装保留余量。
+// 协议4将业务JSON放入payload前缀；沿用60KiB业务预算，避免升级时无故淘汰策略变化。
 pub const STATE_FRAME_BUDGET: usize = 60 * 1024;
 const PENDING_RESULT_RESERVE: usize = 1024;
 
@@ -73,13 +73,8 @@ pub fn state_metadata_bytes(key: &str, value: &impl Serialize) -> Result<usize, 
         expected_version: Some(u64::MAX),
     })
     .map_err(|_| "状态请求编码失败")?;
-    let frame = Frame::control(Message::Callback {
-        id: u64::MAX,
-        parent_id: u64::MAX,
-        method: "host.state.put".into(),
-        params,
-    });
-    serde_json::to_vec(&frame.message)
+    // 不能序列化Message估算：协议4的params/result带serde(skip)，会漏掉全部业务值。
+    serde_json::to_vec(&json!({"type":"callback","id":u64::MAX,"parent_id":u64::MAX,"method":"host.state.put","params":params}))
         .map(|bytes| bytes.len())
         .map_err(|_| "状态请求编码失败".into())
 }
@@ -268,6 +263,36 @@ mod tests {
             state_metadata_bytes("history", &json!({"text":"中".repeat(1000)})).unwrap() > 3000
         );
         assert!(state_metadata_bytes("history", &json!({})).unwrap() > 150);
+    }
+    #[tokio::test]
+    async fn protocol_four_business_json_and_binary_payload_round_trip() {
+        use gateway_plugin_sdk::client::{read_frame, write_frame};
+        let value = json!({"text":"x".repeat(70 * 1024)});
+        let frame = Frame {
+            message: Message::Callback {
+                id: 7,
+                parent_id: 9,
+                method: "host.state.put".into(),
+                params: value.clone(),
+            },
+            payload: b"fixture-binary".to_vec(),
+        };
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &frame).await.unwrap();
+        let metadata_len = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+        assert!(metadata_len < 1024);
+        let metadata: Value = serde_json::from_slice(&wire[12..12 + metadata_len]).unwrap();
+        assert!(metadata.get("params").is_none());
+        assert_eq!(
+            metadata["data_bytes"],
+            serde_json::to_vec(&value).unwrap().len()
+        );
+        let decoded = read_frame(&mut wire.as_slice()).await.unwrap();
+        match decoded.message {
+            Message::Callback { params, .. } => assert_eq!(params, value),
+            _ => panic!("unexpected frame"),
+        }
+        assert_eq!(decoded.payload, b"fixture-binary");
     }
     #[test]
     fn sdk_frames_accept_reserved_put_and_get_envelopes() {
