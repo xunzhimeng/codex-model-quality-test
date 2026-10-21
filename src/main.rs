@@ -115,7 +115,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
         assert_eq!(source["manifestVersion"], 2);
         assert!(source.get("permissions").is_none());
-        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.29.3");
+        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.29.7");
         assert_eq!(source["version"], env!("CARGO_PKG_VERSION"));
         let manifest =
             gateway_plugin_sdk::Manifest::from_author_slice(include_bytes!("../plugin.json"))
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(source["contributes"]["management"]["version"], 2);
         assert_eq!(manifest.state[0].schema_version, 1);
         assert_eq!(manifest.state[0].namespace, "quality");
-        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 4);
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 5);
     }
 
     #[test]

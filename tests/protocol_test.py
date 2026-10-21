@@ -26,7 +26,7 @@ def events(answer='21'):
     return b'HME1' + struct.pack('>II', 1, len(event)) + event
 
 def frame_bytes(message,payload=b''):
-    # 协议4将配置、业务JSON和入口快照移到独立payload前缀，不能只改握手版本。
+    # 协议5沿用独立JSON前缀，不能只改握手版本而忽略回调合同。
     import copy
     message=copy.deepcopy(message);prefix=b''
     if message['type']=='call':
@@ -95,10 +95,10 @@ class Host:
         self.on_stream = None
         self.on_account_read = None
         self.stall_stream = False
-        self.write({'type':'hello','handshake':{'protocol_version':4,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
+        self.write({'type':'hello','handshake':{'protocol_version':5,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
         message,_ = self.messages.get(timeout=5)
-        assert message['type'] == 'ready' and message['protocol_version'] == 4, message
+        assert message['type'] == 'ready' and message['protocol_version'] == 5, message
         self.next_id = 11
         self.registration = self.call('management.register', stage='registration')
         # 先检查相对路由，再按注册表分发，避免桩直接接受宿主会拒绝的路径。
@@ -692,7 +692,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.host.states['history'],old['history'])
         self.assertEqual(self.host.states['bank'],old['bank'])
         self.assertEqual(self.host.states['monitor']['value']['accounts']['fixture-account']['total_runs'],1)
-    def test_protocol_four_large_business_input_and_payload_remain_separate(self):
+    def test_protocol_five_large_business_input_and_payload_remain_separate(self):
         bank=[{'id':f'custom_frame_{i}','title':'协议四','category':'数学','prompt':'x'*7999,'answer':'1'} for i in range(9)]
         status,result=self.host.call('POST','questions',{'questions':bank,'expected_version':None})
         self.assertEqual(status,400,result)

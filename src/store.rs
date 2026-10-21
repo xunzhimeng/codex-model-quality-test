@@ -60,7 +60,7 @@ pub async fn get<T: DeserializeOwned + Default>(
     }
 }
 
-// 协议4将业务JSON放入payload前缀；沿用60KiB业务预算，避免升级时无故淘汰策略变化。
+// 协议5沿用业务JSON的payload前缀；沿用60KiB业务预算，避免升级时无故淘汰策略变化。
 pub const STATE_FRAME_BUDGET: usize = 60 * 1024;
 const PENDING_RESULT_RESERVE: usize = 1024;
 
@@ -73,7 +73,7 @@ pub fn state_metadata_bytes(key: &str, value: &impl Serialize) -> Result<usize, 
         expected_version: Some(u64::MAX),
     })
     .map_err(|_| "状态请求编码失败")?;
-    // 不能序列化Message估算：协议4的params/result带serde(skip)，会漏掉全部业务值。
+    // 不能序列化Message估算：当前协议的params/result带serde(skip)，会漏掉全部业务值。
     serde_json::to_vec(&json!({"type":"callback","id":u64::MAX,"parent_id":u64::MAX,"method":"host.state.put","params":params}))
         .map(|bytes| bytes.len())
         .map_err(|_| "状态请求编码失败".into())
@@ -265,7 +265,7 @@ mod tests {
         assert!(state_metadata_bytes("history", &json!({})).unwrap() > 150);
     }
     #[tokio::test]
-    async fn protocol_four_business_json_and_binary_payload_round_trip() {
+    async fn protocol_five_business_json_and_binary_payload_round_trip() {
         use gateway_plugin_sdk::client::{read_frame, write_frame};
         let value = json!({"text":"x".repeat(70 * 1024)});
         let frame = Frame {
