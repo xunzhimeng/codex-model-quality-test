@@ -10,6 +10,7 @@ interface Snapshot { tasks: Task[]; defaults: Settings; total_runs: number; dail
 const props = defineProps<{ accounts: Account[]; keys: Key[] }>()
 const snapshot = ref<Snapshot | null>(null), busy = ref(false), error = ref(''), notice = ref('')
 const dialog = ref<HTMLDialogElement | null>(null), refreshButton = ref<HTMLButtonElement | null>(null), editorOpen = ref(false), editingId = ref<string | null>(null), editGeneration = ref<string | null>(null)
+const deleteDialog = ref<HTMLDialogElement | null>(null), deleteOpen = ref(false), deletingTask = ref<Task | null>(null), deleteError = ref('')
 const settings = ref<Settings | null>(null), taskName = ref(''), filter = ref(''), editorError = ref('')
 let previousFocus: HTMLElement | null = null
 const quietEnabled = computed({ get: () => !!settings.value?.quiet_hours, set: enabled => { if (settings.value) settings.value.quiet_hours = enabled ? { start: '23:00', end: '07:00' } : null } })
@@ -49,7 +50,7 @@ async function openEditor(task: Task | null, event: Event) {
   void loadModels()
 }
 function restoreFocus() {
-  if (!previousFocus || busy.value) return
+  if (!previousFocus || busy.value || editorOpen.value || deleteOpen.value) return
   if (previousFocus.isConnected && !previousFocus.matches(':disabled')) previousFocus.focus()
   else refreshButton.value?.focus()
   previousFocus = null
@@ -88,6 +89,29 @@ async function save() {
     notice.value = '任务已保存，确认命中已清零，执行次数保留'
     dialog.value?.close()
   } catch (e) { editorError.value = failure(e) } finally { busy.value = false }
+}
+async function openDelete(task: Task, event: Event) {
+  if (busy.value) return
+  previousFocus = event.currentTarget as HTMLElement
+  // 固定用户确认时看到的版本，刷新或其他页面变更后由后端拒绝陈旧删除。
+  deletingTask.value = task; deleteError.value = ''; deleteOpen.value = true
+  await nextTick()
+  deleteDialog.value?.showModal()
+  deleteDialog.value?.querySelector<HTMLButtonElement>('button')?.focus()
+}
+async function deleteClosed() {
+  deleteOpen.value = false; deletingTask.value = null
+  await nextTick(); restoreFocus()
+}
+async function deleteTask() {
+  const task = deletingTask.value
+  if (busy.value || !task) return
+  busy.value = true; deleteError.value = ''; error.value = ''; notice.value = ''
+  try {
+    snapshot.value = await request<Snapshot>('monitor/delete', { task_id: task.id, expected_generation: task.state.generation, expected_control_revision: task.state.control_revision })
+    notice.value = '任务已删除，测试历史保留，账号启用状态未改变'
+    deleteDialog.value?.close()
+  } catch (e) { deleteError.value = (e as Error).message } finally { busy.value = false }
 }
 async function toggleScheduled(task: Task) {
   if (busy.value) return
@@ -133,6 +157,7 @@ onMounted(load)
           <div class="monitor-task-title"><strong>{{ task.name }}</strong> <span class="badge">{{ taskStatus(task) }}</span><small>{{ task.state.settings.model || '未选择模型' }} · 每 {{ task.state.settings.interval_minutes }} 分钟 · {{ task.state.settings.account_ids.length }} 个账号 · {{ task.state.settings.auto_disable ? '自动停用已开启' : '不自动停用' }}</small></div>
           <div class="inline">
             <button :disabled="busy" :aria-label="'编辑任务 ' + task.name" @click="openEditor(task, $event)">编辑</button>
+            <button class="danger" :disabled="busy" :aria-label="'删除任务 ' + task.name" @click="openDelete(task, $event)">删除</button>
             <button :disabled="busy" :aria-label="(task.state.settings.scheduled ? '关闭任务 ' : '启用任务 ') + task.name" @click="toggleScheduled(task)">{{ task.state.settings.scheduled ? '关闭任务' : '启用任务' }}</button>
             <button :disabled="busy || !task.state.settings.scheduled" :aria-label="(task.state.paused ? '继续任务 ' : '暂停任务 ') + task.name" @click="control(!task.state.paused, task)">{{ task.state.paused ? '继续' : '暂停' }}</button>
           </div>
@@ -167,6 +192,15 @@ onMounted(load)
     </div></details>
   </section>
 
+  <dialog ref="deleteDialog" class="dialog monitor-delete" aria-labelledby="monitor-delete-title" aria-describedby="monitor-delete-description" @close="deleteClosed" @cancel="busy && $event.preventDefault()">
+    <template v-if="deletingTask">
+      <strong id="monitor-delete-title">删除监控任务</strong>
+      <p id="monitor-delete-description">确认删除「{{ deletingTask.name }}」及其次数统计和处置明细？测试历史保留，不改变账号启用状态。此操作不可撤销。</p>
+      <p class="muted">执行中或隔离中的测试、未确认停用动作会阻止删除，请先暂停并核对状态。</p>
+      <div v-if="deleteError" role="alert" class="alert error">{{ deleteError }}</div>
+      <div class="runbar"><span></span><div class="inline"><button :disabled="busy" @click="deleteDialog?.close()">取消</button><button class="danger" :disabled="busy" @click="deleteTask">{{ busy ? '删除中' : '确认删除' }}</button></div></div>
+    </template>
+  </dialog>
   <dialog ref="dialog" class="dialog monitor-editor" aria-labelledby="monitor-editor-title" @close="editorClosed">
     <form v-if="editorOpen && settings" @submit.prevent="save">
       <div class="section-head"><strong id="monitor-editor-title">{{ editingId === null ? '创建监控任务' : '编辑监控任务' }}</strong><button type="button" aria-label="关闭任务编辑" @click="dialog?.close()">关闭</button></div>
@@ -193,6 +227,10 @@ onMounted(load)
 </template>
 
 <style scoped>
+.danger { color: var(--danger); border-color: var(--danger); }
+.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); background: color-mix(in srgb, var(--danger) 7%, var(--surface)); }
+.monitor-delete { color: var(--text); width: min(480px, calc(100% - 24px)); overflow-wrap: anywhere; }
+.monitor-delete::backdrop { background: #0006; }
 .monitor-task { padding: 16px 0; border-top: 1px solid var(--border); }
 .monitor-task .section-head { margin-bottom: 8px; }
 .monitor-task-title { min-width: 0; overflow-wrap: anywhere; }

@@ -279,6 +279,13 @@ pub struct Control {
     pub expected_generation: String,
     pub expected_control_revision: u64,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delete {
+    pub task_id: String,
+    pub expected_generation: String,
+    pub expected_control_revision: u64,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -527,6 +534,43 @@ impl Monitor {
         {
             return Err(error);
         }
+        store::put(host, "monitor", &registry, version).await?;
+        drop(_guard);
+        self.snapshot(host).await
+    }
+    pub async fn delete(&self, host: &HostClient, request: Delete) -> Result<Value, String> {
+        let _guard = self.lock.lock().await;
+        let (mut registry, version) = self.load(host).await?;
+        let index = registry
+            .tasks
+            .iter()
+            .position(|task| task.id == request.task_id)
+            .ok_or("监控任务不存在，请刷新列表")?;
+        let state = &registry.tasks[index].state;
+        if state.generation != request.expected_generation
+            || state.control_revision != request.expected_control_revision
+        {
+            return Err("监控任务已变化，请刷新后再删除".into());
+        }
+        let now = now_ms();
+        // 不丢弃在途凭证或未确认停用意图，否则其他任务可能重叠请求或重复提交停用。
+        if state.accounts.values().any(|status| {
+            status
+                .active
+                .as_ref()
+                .is_some_and(|run| now.saturating_sub(run.started_ms) < RUN_LEASE)
+        }) {
+            return Err("任务仍有执行中或隔离中的测试，请先暂停，等待结束后再删除".into());
+        }
+        if state
+            .accounts
+            .values()
+            .any(|status| matches!(status.action.as_str(), "pending" | "unconfirmed"))
+        {
+            return Err("任务存在未确认停用动作，暂不可删除，以免丢失安全审计或重复停用".into());
+        }
+        registry.tasks.remove(index);
+        registry.control_revision = registry.control_revision.saturating_add(1);
         store::put(host, "monitor", &registry, version).await?;
         drop(_guard);
         self.snapshot(host).await

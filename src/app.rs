@@ -275,6 +275,10 @@ impl App {
                 let request: monitor::Save = decode(&call.payload)?;
                 json_response(200, &self.monitor.save(host, request).await?)
             }
+            ("POST", "monitor/delete") => {
+                let request: monitor::Delete = decode(&call.payload)?;
+                json_response(200, &self.monitor.delete(host, request).await?)
+            }
             ("POST", "monitor/control") => {
                 let request: monitor::Control = decode(&call.payload)?;
                 json_response(200, &self.monitor.control(host, request).await?)

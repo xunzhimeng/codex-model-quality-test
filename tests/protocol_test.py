@@ -304,6 +304,82 @@ class Integration(unittest.TestCase):
         config={'scheduled':True,'auto_disable':False,'interval_minutes':30,'model':'fixture-model','client_key_id':'fixture-key','account_ids':['fixture-account'],'daily_max':48,'quiet_hours':None}
         config.update(settings)
         return self.host.call('POST','monitor',{'task_id':None,'name':name,'settings':config,'expected_generation':None})
+    def delete_task(self,task):
+        return self.host.call('POST','monitor/delete',{'task_id':task['id'],'expected_generation':task['state']['generation'],'expected_control_revision':task['state']['control_revision']})
+    def test_delete_task_preserves_history_other_tasks_and_account_status(self):
+        self.configure_monitor(auto_disable=False);self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.new_task('保留任务')
+        before=self.host.call('GET','monitor')[1];history=dump(self.host.states['history']);account=self.host.account_enabled
+        first,second=before['tasks']
+        status,result=self.delete_task(first)
+        self.assertEqual(status,200,result);self.assertEqual(result['tasks'],[second])
+        self.assertEqual(result['total_runs'],second['total_runs'])
+        self.assertGreater(result['control_revision'],before['control_revision'])
+        self.assertEqual(dump(self.host.states['history']),history);self.assertEqual(self.host.account_enabled,account)
+        self.assertEqual(self.host.disable_count,0)
+        self.assertEqual(self.delete_task(first)[0],400)
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,2)
+        import copy
+        states=copy.deepcopy(self.host.states)
+        self.host.close();self.host=Host();self.host.states=states
+        # 重启不重新迁移生成已删除任务。
+        self.assertEqual([t['id'] for t in self.host.call('GET','monitor')[1]['tasks']],[second['id']])
+    def test_delete_last_task_keeps_empty_registry_and_frees_creation_slot(self):
+        for i in range(10):self.assertEqual(self.new_task(str(i),scheduled=False,auto_disable=False)[0],200)
+        first=self.host.call('GET','monitor')[1]['tasks'][0]
+        self.assertEqual(self.delete_task(first)[0],200)
+        self.assertEqual(self.new_task('重新创建',scheduled=False,auto_disable=False)[0],200)
+        for task in self.host.call('GET','monitor')[1]['tasks']:self.assertEqual(self.delete_task(task)[0],200)
+        snapshot=self.host.call('GET','monitor')[1]
+        self.assertEqual(snapshot['tasks'],[]);self.assertEqual(snapshot['total_runs'],0)
+        self.assertEqual(self.host.states['monitor']['value']['tasks_version'],1)
+    def test_delete_rejects_stale_edit_or_pause_version(self):
+        self.configure_monitor()
+        old=self.host.call('GET','monitor')[1]['tasks'][0]
+        self.control(True)
+        self.assertEqual(self.delete_task(old)[0],400)
+        task=self.host.call('GET','monitor')[1]['tasks'][0]
+        settings={**task['state']['settings'],'interval_minutes':45}
+        self.host.call('POST','monitor',{'task_id':task['id'],'name':task['name'],'settings':settings,'expected_generation':task['state']['generation']})
+        self.assertEqual(self.delete_task(task)[0],400)
+        self.assertEqual(len(self.host.call('GET','monitor')[1]['tasks']),1)
+    def test_delete_active_task_waits_for_completion_or_expired_isolation(self):
+        self.configure_monitor();self.host.stall_stream=True;self.due()
+        call_id=self.host.next_id
+        self.host.on_stream=lambda:self.host.write({'type':'cancel','id':call_id})
+        self.assertEqual(self.host.call('plugin.reconcile',stage='maintenance')[0],'cancelled')
+        self.host.on_stream=None;self.host.stall_stream=False
+        task=self.host.call('GET','monitor')[1]['tasks'][0]
+        status,result=self.delete_task(task);self.assertEqual(status,400,result);self.assertIn('执行中或隔离',result['error'])
+        self.task_state()['accounts']['fixture-account']['active']['started_ms']=0
+        self.assertEqual(self.delete_task(task)[0],200)
+        self.assertEqual(self.host.proxy.connects,1)
+    def test_delete_cannot_drop_unconfirmed_disable_guard(self):
+        self.configure_monitor(degradation_policy='immediate');self.host.fail_disable=True
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        task=self.host.call('GET','monitor')[1]['tasks'][0]
+        status,result=self.delete_task(task)
+        self.assertEqual(status,400,result);self.assertIn('未确认停用',result['error'])
+        self.assertEqual(self.host.disable_count,1)
+        self.assertEqual(len(self.host.call('GET','monitor')[1]['tasks']),1)
+        self.task_state()['accounts']['fixture-account']['action']='pending'
+        status,result=self.delete_task(task)
+        self.assertEqual(status,400,result);self.assertIn('未确认停用',result['error'])
+    def test_delete_confirmed_disabled_task_does_not_restore_account(self):
+        self.configure_monitor(degradation_policy='immediate');self.due()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        task=self.host.call('GET','monitor')[1]['tasks'][0]
+        self.assertEqual(task['state']['accounts']['fixture-account']['action'],'disabled')
+        self.assertFalse(self.host.account_enabled);self.assertEqual(self.host.disable_count,1)
+        history=dump(self.host.states['history'])
+        self.assertEqual(self.delete_task(task)[0],200)
+        self.assertFalse(self.host.account_enabled);self.assertEqual(self.host.disable_count,1)
+        self.assertEqual(dump(self.host.states['history']),history)
+    def test_delete_does_not_refresh_stale_global_control(self):
+        self.configure_monitor();before=self.host.call('GET','monitor')[1]
+        self.assertEqual(self.delete_task(before['tasks'][0])[0],200)
+        body={'task_id':None,'account_id':None,'paused':True,'expected_generation':'','expected_control_revision':before['control_revision']}
+        self.assertEqual(self.host.call('POST','monitor/control',body)[0],400)
     def test_multiple_tasks_share_account_but_keep_settings_counts_and_confirmations_separate(self):
         self.configure_monitor(auto_disable=False,daily_max=1)
         status,snapshot=self.new_task('sol探针',daily_max=2,interval_minutes=60)
