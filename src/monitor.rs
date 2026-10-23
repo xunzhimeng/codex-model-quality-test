@@ -265,46 +265,118 @@ pub struct State {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Save {
+    pub task_id: Option<String>,
+    pub name: String,
     pub settings: Settings,
     pub expected_generation: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Control {
+    pub task_id: Option<String>,
     pub account_id: Option<String>,
     pub paused: bool,
     pub expected_generation: String,
     pub expected_control_revision: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub name: String,
+    pub state: State,
+}
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct Registry {
+    pub tasks_version: u32,
+    pub tasks: Vec<Task>,
+    #[serde(default)]
+    pub control_revision: u64,
+}
+fn bounded_error(error: String) -> String {
+    // 宿主回调错误不应使整个任务集合无法写回，留存短安全摘要。
+    error
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(120)
+        .collect()
+}
+impl Registry {
+    fn validate_capacity(&self) -> Result<(), String> {
+        let accounts: usize = self
+            .tasks
+            .iter()
+            .map(|task| {
+                task.state
+                    .accounts
+                    .iter()
+                    .filter(|(id, status)| {
+                        task.state.settings.account_ids.contains(id) || status.active.is_some()
+                    })
+                    .count()
+            })
+            .sum();
+        // 为所有保留账号的计数、预约、结果和有界停用审计预留余量，不只预算当前空配置。
+        let reserve = accounts.saturating_mul(1024) + self.tasks.len() * 1024 + 1024;
+        if store::state_metadata_bytes("monitor", self)?.saturating_add(reserve)
+            > store::STATE_FRAME_BUDGET
+        {
+            return Err("监控任务总容量不足，请减少新任务账号或配置，原计数和审计不会删除".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Clone)]
+pub struct RunContext {
+    pub task_id: String,
+    pub generation: String,
 }
 #[derive(Default)]
 pub struct Monitor {
     lock: Mutex<()>,
 }
 impl Monitor {
-    async fn load(&self, host: &HostClient) -> Result<(State, Option<u64>), String> {
-        let (mut state, version) = store::get::<State>(host, "monitor").await?;
-        if version.is_some() && state.probe_version < 2 {
-            // 新确认策略不继承旧命中，也不悄悄替现有计划增加自动请求。
-            state.probe_version = 2;
-            state.settings.scheduled = false;
-            state.settings.auto_disable = false;
-            state.generation = uuid::Uuid::new_v4().to_string();
-            for status in state.accounts.values_mut() {
-                status.reset_confirmation();
-                status.active = None;
-            }
-            state.last_error = Some(
-                "监控规则已更新，旧计划已关闭，请核对每日上限与不测试时段后重新保存启用".into(),
-            );
-            store::put(host, "monitor", &state, version).await?;
-            return store::get::<State>(host, "monitor").await;
+    async fn load(&self, host: &HostClient) -> Result<(Registry, Option<u64>), String> {
+        let (value, version) = store::get::<Value>(host, "monitor").await?;
+        if value.is_null() {
+            return Ok((
+                Registry {
+                    tasks_version: 1,
+                    ..Registry::default()
+                },
+                version,
+            ));
         }
-        Ok((state, version))
+        if value.get("tasks_version").is_some() {
+            let registry: Registry =
+                serde_json::from_value(value).map_err(|_| "监控任务状态无法读取")?;
+            if registry.tasks_version != 1 {
+                return Err("监控任务状态版本不支持".into());
+            }
+            return Ok((registry, version));
+        }
+        let mut state: State = serde_json::from_value(value).map_err(|_| "旧监控状态无法读取")?;
+        // 用户确认升级不自动发请求，保留设置、计数和审计，只暂停与作废旧确认。
+        state.paused = true;
+        state.generation = uuid::Uuid::new_v4().to_string();
+        for status in state.accounts.values_mut() {
+            status.reset_confirmation();
+        }
+        state.probe_version = 2;
+        state.last_error = Some("旧计划已迁为暂停任务，请核对配置后继续".into());
+        let registry = Registry {
+            tasks_version: 1,
+            tasks: vec![Task {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "原监控计划".into(),
+                state,
+            }],
+            control_revision: 0,
+        };
+        store::put(host, "monitor", &registry, version).await?;
+        store::get(host, "monitor").await
     }
-    pub async fn snapshot(&self, host: &HostClient) -> Result<Value, String> {
-        let _guard = self.lock.lock().await;
-        let (mut state, version) = self.load(host).await?;
-        let now = now_ms();
+    fn task_snapshot(task: &Task, now: u64) -> Value {
+        let mut state = task.state.clone();
         let mut total = 0_u64;
         let mut today = 0_u64;
         let mut availability = BTreeMap::new();
@@ -347,8 +419,21 @@ impl Monitor {
                 .then(|| state.settings.release(due, status));
             availability.insert(id.clone(), json!({"status":reason,"next_allowed_ms":next}));
         }
+        json!({"id":task.id,"name":task.name,"state":state,"availability":availability,"total_runs":total,"daily_runs":today})
+    }
+    pub async fn snapshot(&self, host: &HostClient) -> Result<Value, String> {
+        let _guard = self.lock.lock().await;
+        let (registry, version) = self.load(host).await?;
+        let now = now_ms();
+        let tasks: Vec<_> = registry
+            .tasks
+            .iter()
+            .map(|t| Self::task_snapshot(t, now))
+            .collect();
+        let total: u64 = tasks.iter().filter_map(|t| t["total_runs"].as_u64()).sum();
+        let today: u64 = tasks.iter().filter_map(|t| t["daily_runs"].as_u64()).sum();
         Ok(
-            json!({"state":state,"version":version,"availability":availability,"total_runs":total,"daily_runs":today,"timezone":"Asia/Shanghai","now_ms":now}),
+            json!({"tasks":tasks,"version":version,"control_revision":registry.control_revision,"defaults":Settings::default(),"total_runs":total,"daily_runs":today,"timezone":"Asia/Shanghai","now_ms":now}),
         )
     }
     pub async fn save(&self, host: &HostClient, request: Save) -> Result<Value, String> {
@@ -384,13 +469,43 @@ impl Monitor {
                 }
             }
         }
+        if request.name.trim().is_empty()
+            || request.name.len() > 120
+            || request.name.chars().any(char::is_control)
+        {
+            return Err("任务名称须为1至120字节且不含控制字符".into());
+        }
         let _guard = self.lock.lock().await;
-        let (mut state, version) = self.load(host).await?;
+        let (mut registry, version) = self.load(host).await?;
+        let previous_bytes = store::state_metadata_bytes("monitor", &registry)?;
+        let index = if let Some(id) = &request.task_id {
+            registry
+                .tasks
+                .iter()
+                .position(|t| &t.id == id)
+                .ok_or("监控任务不存在，请刷新")?
+        } else {
+            if request.expected_generation.is_some() {
+                return Err("创建任务不能携带旧设置版本".into());
+            }
+            if registry.tasks.len() >= 10 {
+                return Err("最多创建10个监控任务".into());
+            }
+            registry.tasks.push(Task {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: String::new(),
+                state: State::default(),
+            });
+            registry.tasks.len() - 1
+        };
+        let task = &mut registry.tasks[index];
+        let state = &mut task.state;
         if (!state.generation.is_empty()).then_some(state.generation.as_str())
             != request.expected_generation.as_deref()
         {
             return Err("监控设置已变化，请刷新后再保存".into());
         }
+        task.name = request.name.trim().into();
         state.probe_version = 2;
         state.settings = request.settings;
         state.generation = uuid::Uuid::new_v4().to_string();
@@ -404,43 +519,71 @@ impl Monitor {
             state.accounts.entry(id.clone()).or_default().next_due_ms =
                 now_ms() + u64::from(state.settings.interval_minutes) * MINUTE;
         }
-        store::put(host, "monitor", &state, version).await?;
+        registry.control_revision = registry.control_revision.saturating_add(1);
+        if let Err(error) = registry.validate_capacity()
+            && !(request.task_id.is_some()
+                && !registry.tasks[index].state.settings.scheduled
+                && store::state_metadata_bytes("monitor", &registry)? <= previous_bytes + 128)
+        {
+            return Err(error);
+        }
+        store::put(host, "monitor", &registry, version).await?;
         drop(_guard);
         self.snapshot(host).await
     }
     pub async fn control(&self, host: &HostClient, request: Control) -> Result<Value, String> {
         let _guard = self.lock.lock().await;
-        let (mut state, version) = self.load(host).await?;
-        if state.generation != request.expected_generation
-            || state.control_revision != request.expected_control_revision
+        let (mut registry, version) = self.load(host).await?;
+        if let Some(id) = &request.task_id {
+            let task = registry
+                .tasks
+                .iter()
+                .find(|t| &t.id == id)
+                .ok_or("监控任务不存在")?;
+            if task.state.generation != request.expected_generation
+                || task.state.control_revision != request.expected_control_revision
+            {
+                return Err("监控控制状态已变化，请刷新后再操作".into());
+            }
+        } else if request.account_id.is_some()
+            || registry.control_revision != request.expected_control_revision
         {
             return Err("监控控制状态已变化，请刷新后再操作".into());
         }
-        let ids = if let Some(id) = request.account_id {
-            if !state.settings.account_ids.contains(&id) {
-                return Err("账号不在当前监控计划中".into());
+        for task in &mut registry.tasks {
+            if request.task_id.as_ref().is_some_and(|id| id != &task.id) {
+                continue;
             }
-            state
-                .accounts
-                .get_mut(&id)
-                .ok_or("监控账号状态缺失")?
-                .paused = request.paused;
-            vec![id]
-        } else {
-            state.paused = request.paused;
-            state.settings.account_ids.clone()
-        };
-        for id in ids {
-            if let Some(status) = state.accounts.get_mut(&id) {
-                status.reset_confirmation();
-                if !request.paused {
-                    status.next_due_ms =
-                        now_ms() + u64::from(state.settings.interval_minutes) * MINUTE;
+            let state = &mut task.state;
+            if !request.paused && state.settings.scheduled {
+                state.settings.validate()?;
+            }
+            let ids = if let Some(id) = &request.account_id {
+                if !state.settings.account_ids.contains(id) {
+                    return Err("账号不在当前任务中".into());
+                }
+                state.accounts.get_mut(id).ok_or("监控账号状态缺失")?.paused = request.paused;
+                vec![id.clone()]
+            } else {
+                state.paused = request.paused;
+                state.settings.account_ids.clone()
+            };
+            for id in ids {
+                if let Some(status) = state.accounts.get_mut(&id) {
+                    status.reset_confirmation();
+                    if !request.paused {
+                        status.next_due_ms =
+                            now_ms() + u64::from(state.settings.interval_minutes) * MINUTE;
+                    }
                 }
             }
+            state.control_revision = state.control_revision.saturating_add(1);
         }
-        state.control_revision = state.control_revision.saturating_add(1);
-        store::put(host, "monitor", &state, version).await?;
+        registry.control_revision = registry.control_revision.saturating_add(1);
+        if !request.paused {
+            registry.validate_capacity()?;
+        }
+        store::put(host, "monitor", &registry, version).await?;
         drop(_guard);
         self.snapshot(host).await
     }
@@ -448,12 +591,16 @@ impl Monitor {
         &self,
         host: &HostClient,
         request: &RunRequest,
-        generation: &str,
+        context: &RunContext,
     ) -> Result<bool, String> {
         let _guard = self.lock.lock().await;
-        let (mut state, version) = self.load(host).await?;
+        let (mut registry, version) = self.load(host).await?;
+        let Some(task) = registry.tasks.iter_mut().find(|t| t.id == context.task_id) else {
+            return Ok(false);
+        };
+        let state = &mut task.state;
         let now = now_ms();
-        if state.generation != generation || !state.settings.scheduled || state.paused {
+        if state.generation != context.generation || !state.settings.scheduled || state.paused {
             return Ok(false);
         }
         let Some(status) = state.accounts.get_mut(&request.account_id) else {
@@ -474,17 +621,28 @@ impl Monitor {
         status.count(now);
         status.active.as_mut().unwrap().counted = true;
         status.last_status = "running".into();
-        store::put(host, "monitor", &state, version).await?;
+        store::put(host, "monitor", &registry, version).await?;
         Ok(true)
     }
     pub async fn observe(
         &self,
         host: &HostClient,
         record: &mut Record,
-        generation: &str,
+        context: &RunContext,
     ) -> Result<(), String> {
         let _guard = self.lock.lock().await;
-        let (mut state, version) = self.load(host).await?;
+        let (mut registry, version) = self.load(host).await?;
+        let unresolved_action = registry.tasks.iter().any(|task| {
+            task.state
+                .accounts
+                .get(&record.account_id)
+                .is_some_and(|status| matches!(status.action.as_str(), "pending" | "unconfirmed"))
+        });
+        let Some(task) = registry.tasks.iter_mut().find(|t| t.id == context.task_id) else {
+            return Ok(());
+        };
+        let task_name = task.name.clone();
+        let state = &mut task.state;
         let now = record.finished_at_ms.unwrap_or_else(now_ms);
         let Some(status) = state.accounts.get_mut(&record.account_id) else {
             return Ok(());
@@ -500,7 +658,7 @@ impl Monitor {
         status.last_checked_ms = Some(now);
         status.last_status = record.status.clone();
         let valid = active.valid
-            && state.generation == generation
+            && state.generation == context.generation
             && state.settings.scheduled
             && !state.paused
             && !status.paused
@@ -521,7 +679,9 @@ impl Monitor {
             if record.status == "degraded" {
                 if policy == DegradationPolicy::Immediate || active.confirmation {
                     status.streak = threshold;
-                    should_disable = state.settings.auto_disable && status.action.is_empty();
+                    should_disable = state.settings.auto_disable
+                        && status.action.is_empty()
+                        && !unresolved_action;
                 } else if let Some(due) = state.settings.confirmation_due(now, status) {
                     status.streak = 1;
                     status.confirm_due_ms = Some(due);
@@ -539,13 +699,22 @@ impl Monitor {
             }
             .into();
         }
-        record.metrics["monitor"] = json!({"streak":status.streak,"threshold":threshold,"confirmation":active.confirmation,"policy":policy,"action":status.action,"detail":status.action_detail});
-        store::put(host, "monitor", &state, version).await?;
+        record.metrics["monitor"] = json!({"task_id":context.task_id,"task_name":task_name,"streak":status.streak,"threshold":threshold,"confirmation":active.confirmation,"policy":policy,"action":status.action,"detail":status.action_detail});
+        if unresolved_action && status.action.is_empty() {
+            record.metrics["monitor"]["detail"] =
+                json!("同账号已有未确认停用动作，未重复提交，请核对原任务审计");
+        }
+        store::put(host, "monitor", &registry, version).await?;
         if !should_disable {
             return Ok(());
         }
         let result = accounts::disable(host, &record.account_id).await;
-        let (mut state, version) = self.load(host).await?;
+        let (mut registry, version) = self.load(host).await?;
+        let Some(task) = registry.tasks.iter_mut().find(|t| t.id == context.task_id) else {
+            return Ok(());
+        };
+        let task_name = task.name.clone();
+        let state = &mut task.state;
         if let Some(status) = state.accounts.get_mut(&record.account_id) {
             match result {
                 Ok(()) => {
@@ -559,66 +728,80 @@ impl Monitor {
                 }
                 Err(error) => {
                     status.action = "unconfirmed".into();
-                    status.action_detail = error;
+                    status.action_detail = bounded_error(error);
                 }
             }
-            record.metrics["monitor"] = json!({"streak":status.streak,"threshold":threshold,"confirmation":active.confirmation,"policy":policy,"action":status.action,"detail":status.action_detail});
+            record.metrics["monitor"] = json!({"task_id":context.task_id,"task_name":task_name,"streak":status.streak,"threshold":threshold,"confirmation":active.confirmation,"policy":policy,"action":status.action,"detail":status.action_detail});
         }
-        store::put(host, "monitor", &state, version).await
+        store::put(host, "monitor", &registry, version).await
     }
     pub async fn tick(&self, app: &App, host: &HostClient) -> Result<(), String> {
         let job = {
             let _guard = self.lock.lock().await;
-            let (mut state, version) = self.load(host).await?;
-            if !state.settings.scheduled {
-                return Ok(());
-            }
+            let (mut registry, version) = self.load(host).await?;
             let now = now_ms();
-            state.last_tick_ms = Some(now);
-            for status in state.accounts.values_mut() {
-                if status
-                    .active
-                    .as_ref()
-                    .is_some_and(|run| now.saturating_sub(run.started_ms) >= RUN_LEASE)
-                {
-                    status.active = None;
-                    status.reset_confirmation();
-                    status.last_status = "interrupted".into();
-                }
-                if status.confirm_due_ms.is_some_and(|due| {
-                    due <= now
-                        && (state.settings.release(now, status) > now
-                            || !state
-                                .settings
-                                .confirmation_current(due, status.next_due_ms, now))
-                }) {
-                    // 维护中断跨过禁测时段或常规周期，不使用陈旧结果自动停用。
-                    status.reset_confirmation();
+            for task in &mut registry.tasks {
+                let state = &mut task.state;
+                state.last_tick_ms = Some(now);
+                for status in state.accounts.values_mut() {
+                    if status
+                        .active
+                        .as_ref()
+                        .is_some_and(|run| now.saturating_sub(run.started_ms) >= RUN_LEASE)
+                    {
+                        status.active = None;
+                        status.reset_confirmation();
+                        status.last_status = "interrupted".into();
+                    }
+                    if status.confirm_due_ms.is_some_and(|due| {
+                        due <= now
+                            && (state.settings.release(now, status) > now
+                                || !state.settings.confirmation_current(
+                                    due,
+                                    status.next_due_ms,
+                                    now,
+                                ))
+                    }) {
+                        status.reset_confirmation();
+                    }
                 }
             }
-            let due = if state.paused {
-                None
-            } else {
-                state
-                    .settings
-                    .account_ids
-                    .iter()
-                    .filter_map(|id| {
-                        let status = state.accounts.get(id)?;
-                        let at = status.confirm_due_ms.unwrap_or(status.next_due_ms);
-                        (!status.paused
-                            && status.active.is_none()
-                            && at <= now
-                            && state.settings.release(now, status) == now)
-                            .then_some((id.clone(), at))
-                    })
-                    .min_by_key(|(_, at)| *at)
-                    .map(|(id, _)| id)
-            };
-            let Some(id) = due else {
-                store::put(host, "monitor", &state, version).await?;
+            // 跨任务共享账号互斥；未结束预约在重启后同样阻止其他任务重叠发送。
+            let active: BTreeSet<_> = registry
+                .tasks
+                .iter()
+                .flat_map(|t| t.state.accounts.iter())
+                .filter(|(_, s)| s.active.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut due = Vec::new();
+            for (index, task) in registry.tasks.iter().enumerate() {
+                let state = &task.state;
+                if !state.settings.scheduled || state.paused {
+                    continue;
+                }
+                for id in &state.settings.account_ids {
+                    let Some(status) = state.accounts.get(id) else {
+                        continue;
+                    };
+                    let at = status.confirm_due_ms.unwrap_or(status.next_due_ms);
+                    if !status.paused
+                        && !active.contains(id)
+                        && !app.account_busy(id)
+                        && at <= now
+                        && state.settings.release(now, status) == now
+                    {
+                        due.push((at, index, id.clone()));
+                    }
+                }
+            }
+            due.sort();
+            let Some((_, index, id)) = due.into_iter().next() else {
+                store::put(host, "monitor", &registry, version).await?;
                 return Ok(());
             };
+            let task = &mut registry.tasks[index];
+            let state = &mut task.state;
             let status = state.accounts.get_mut(&id).unwrap();
             let request_id = uuid::Uuid::new_v4().to_string();
             let confirmation = status.confirm_due_ms.take().is_some();
@@ -631,14 +814,18 @@ impl Monitor {
             });
             status.next_due_ms = now + u64::from(state.settings.interval_minutes) * MINUTE;
             state.last_error = None;
+            let context = RunContext {
+                task_id: task.id.clone(),
+                generation: state.generation.clone(),
+            };
             let job = (
                 id,
                 request_id,
                 state.settings.model.clone(),
-                state.generation.clone(),
+                context,
                 state.settings.client_key_id.clone(),
             );
-            store::put(host, "monitor", &state, version).await?;
+            store::put(host, "monitor", &registry, version).await?;
             job
         };
         let request = RunRequest {
@@ -651,25 +838,28 @@ impl Monitor {
             client_key_id: job.4,
             question_id: None,
         };
-        // 复测通过下一次维护回调预约，不在30秒父调用中sleep，也不脱离父调用发请求。
         let result = app.run(host, request, 18, Some(job.3.clone()), true).await;
         if let Err(error) = result {
             let _guard = self.lock.lock().await;
-            let (mut state, version) = self.load(host).await?;
-            if let Some(status) = state.accounts.get_mut(&job.0)
-                && status.active.as_ref().is_some_and(|run| run.id == job.1)
-            {
-                status.active = None;
-                status.reset_confirmation();
-                status.last_status = "skipped".into();
-                status.last_checked_ms = Some(now_ms());
-                state.last_error = Some(error);
-                store::put(host, "monitor", &state, version).await?;
+            let (mut registry, version) = self.load(host).await?;
+            if let Some(task) = registry.tasks.iter_mut().find(|t| t.id == job.3.task_id) {
+                let state = &mut task.state;
+                if let Some(status) = state.accounts.get_mut(&job.0)
+                    && status.active.as_ref().is_some_and(|r| r.id == job.1)
+                {
+                    status.active = None;
+                    status.reset_confirmation();
+                    status.last_status = "skipped".into();
+                    status.last_checked_ms = Some(now_ms());
+                    state.last_error = Some(bounded_error(error));
+                    store::put(host, "monitor", &registry, version).await?;
+                }
             }
         }
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +935,59 @@ mod tests {
         }
         assert_eq!(DegradationPolicy::Immediate.threshold(), 1);
         assert_eq!(DegradationPolicy::Confirm.threshold(), 2);
+    }
+    #[test]
+    fn registry_reserves_capacity_before_saving_configurations() {
+        let mut registry = Registry {
+            tasks_version: 1,
+            ..Registry::default()
+        };
+        let mut rejected = false;
+        for i in 0..10 {
+            let mut state = State::default();
+            for j in 0..10 {
+                let id = format!("account-{i}-{j}");
+                state.settings.account_ids.push(id.clone());
+                state.accounts.insert(id, AccountState::default());
+            }
+            registry.tasks.push(Task {
+                id: i.to_string(),
+                name: "任务".into(),
+                state,
+            });
+            if registry.validate_capacity().is_err() {
+                rejected = true;
+                break;
+            }
+            // 所有获准账号都增长为执行、满位数计数和有界审计，仍能写入。
+            let mut grown = registry.clone();
+            for task in &mut grown.tasks {
+                task.state.last_error = Some("错".repeat(120));
+                for status in task.state.accounts.values_mut() {
+                    status.total_runs = u64::MAX;
+                    status.daily_runs = u64::MAX;
+                    status.count_day = u64::MAX;
+                    status.last_record_id = "x".repeat(64);
+                    status.last_status = "inconclusive".into();
+                    status.last_checked_ms = Some(u64::MAX);
+                    status.confirm_due_ms = Some(u64::MAX);
+                    status.action = "unconfirmed".into();
+                    status.action_detail = "错".repeat(120);
+                    status.active = Some(ActiveRun {
+                        id: "x".repeat(64),
+                        started_ms: u64::MAX,
+                        counted: true,
+                        confirmation: true,
+                        valid: true,
+                    });
+                }
+            }
+            assert!(
+                store::state_metadata_bytes("monitor", &grown).unwrap()
+                    <= store::STATE_FRAME_BUDGET
+            );
+        }
+        assert!(rejected);
     }
     #[test]
     fn settings_opt_in_and_quota_survives_days() {

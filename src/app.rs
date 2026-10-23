@@ -13,7 +13,7 @@ use gateway_plugin_sdk::{
         management::{ManagementRequest, ManagementResponse},
         model::{CanonicalEvent, ExecutionEvent, FinishReason, Usage},
     },
-    client::{HostClient, TypedCall, TypedReply},
+    client::{HostClient, SessionError, TypedCall, TypedReply},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -55,7 +55,7 @@ impl Drop for AccountGuard {
     }
 }
 
-// 宿主模型调用取消后保留隔离窗口，插件自有探针future结束或取消时连接已释放。
+// 仅宿主模型调用未收到关联终态时保留隔离，解析失败和明确终态错误直接释放。
 struct PendingAccount {
     guard: Option<(AccountGuard, tokio::sync::OwnedSemaphorePermit)>,
     quarantine: bool,
@@ -168,6 +168,11 @@ fn decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, String> {
 }
 
 impl App {
+    pub(crate) fn account_busy(&self, id: &str) -> bool {
+        self.accounts
+            .lock()
+            .map_or(true, |accounts| accounts.contains(id))
+    }
     pub async fn handle(&self, call: TypedCall<ManagementRequest>) -> Result<Response, String> {
         let host = &call.host;
         match (call.request.method.as_str(), call.request.path.as_str()) {
@@ -288,7 +293,7 @@ impl App {
         host: &HostClient,
         request: RunRequest,
         timeout_seconds: u64,
-        monitor_generation: Option<String>,
+        monitor_generation: Option<monitor::RunContext>,
         scheduled: bool,
     ) -> Result<Response, String> {
         request.validate()?;
@@ -299,7 +304,7 @@ impl App {
         {
             let mut accounts = self.accounts.lock().map_err(|_| "账号测试锁不可用")?;
             if !accounts.insert(request.account_id.clone()) {
-                return Err("该账号已有测试在执行".into());
+                return Err("该账号已有测试或未确认调用隔离尚未结束，请稍后再测".into());
             }
         }
         let _account = AccountGuard {
@@ -399,12 +404,12 @@ impl App {
         }
         let mut pending = PendingAccount {
             guard: Some((_account, _slot)),
-            quarantine: request.mode == "question",
+            quarantine: false,
         };
         let outcome = if let Some(q) = question {
             tokio::time::timeout(
                 Duration::from_secs(timeout_seconds),
-                execute_question(host, &request, &q),
+                execute_question(host, &request, &q, &mut pending.quarantine),
             )
             .await
             .unwrap_or_else(|_| Err("测试超时，无法判断，未自动重试".into()))
@@ -418,7 +423,6 @@ impl App {
             .await;
             Ok((r.status, None, r.detail, r.metrics))
         };
-        pending.quarantine = request.mode == "question" && outcome.is_err();
         let mut record = record;
         record.finished_at_ms = Some(now_ms());
         record.latency_ms = Some(now_ms().saturating_sub(started));
@@ -465,6 +469,7 @@ async fn execute_question(
     host: &HostClient,
     request: &RunRequest,
     question: &Question,
+    quarantine: &mut bool,
 ) -> Result<Outcome, String> {
     let mut body = json!({"model":request.model,"input":question.prompt,"store":false});
     if request.effort != "default" {
@@ -479,14 +484,23 @@ async fn execute_question(
         account_id: Some(request.account_id.clone()),
         previous_response_id: None,
     };
-    let reply = host
-        .call(
-            "host.model.execute",
-            serde_json::to_value(metadata).map_err(|_| "模型请求编码失败")?,
-            serde_json::to_vec(&body).map_err(|_| "题目正文编码失败")?,
-        )
-        .await
-        .map_err(|_| "模型调用未完成，请核对Key范围、模型、账号与额度")?;
+    let params = serde_json::to_value(metadata).map_err(|_| "模型请求编码失败")?;
+    let payload = serde_json::to_vec(&body).map_err(|_| "题目正文编码失败")?;
+    // 只有未收到关联终态时保留隔离，评分/解析失败不代表模型仍在执行。
+    *quarantine = true;
+    let reply = match host.call("host.model.execute", params, payload).await {
+        Ok(reply) => {
+            *quarantine = false;
+            reply
+        }
+        Err(SessionError::Remote(_)) => {
+            *quarantine = false;
+            return Err("宿主已结束模型调用并返回错误，请核对Key范围、模型、账号与额度".into());
+        }
+        Err(_) => {
+            return Err("模型调用结果未确认，请核对历史；账号暂保留150秒隔离，未自动重试".into());
+        }
+    };
     let events = ModelEventBatch::decode(&reply.payload).map_err(|_| "模型事件格式无效")?;
     let (text, metrics) = collect_answer(&events.events)?;
     let status = if questions::grade(&text, &question.answer) {
