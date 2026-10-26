@@ -17,7 +17,7 @@ use gateway_plugin_sdk::{
 use std::sync::Arc;
 
 fn call_budgets() -> CallBudgets {
-    // 协议6由插件声明入口预算，保持既有手动/后台上限并留出状态回写时间。
+    // 由插件声明入口预算，保持既有手动/后台上限并留出状态回写时间。
     [(Stage::Management, 120_000), (Stage::Maintenance, 30_000)]
         .into_iter()
         .collect()
@@ -124,7 +124,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
         assert_eq!(source["manifestVersion"], 2);
         assert!(source.get("permissions").is_none());
-        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.32.0");
+        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.33.0");
         assert_eq!(source["version"], env!("CARGO_PKG_VERSION"));
         let manifest =
             gateway_plugin_sdk::Manifest::from_author_slice(include_bytes!("../plugin.json"))
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(source["contributes"]["management"]["version"], 2);
         assert_eq!(manifest.state[0].schema_version, 1);
         assert_eq!(manifest.state[0].namespace, "quality");
-        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 6);
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 7);
     }
 
     #[test]

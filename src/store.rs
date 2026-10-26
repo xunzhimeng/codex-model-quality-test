@@ -265,7 +265,7 @@ mod tests {
         assert!(state_metadata_bytes("history", &json!({})).unwrap() > 150);
     }
     #[tokio::test]
-    async fn protocol_six_business_json_and_binary_payload_round_trip() {
+    async fn protocol_seven_business_json_and_binary_payload_round_trip() {
         use gateway_plugin_sdk::client::{read_frame, write_frame};
         let value = json!({"text":"x".repeat(70 * 1024)});
         let frame = Frame {

@@ -26,7 +26,7 @@ def events(answer='21'):
     return b'HME1' + struct.pack('>II', 1, len(event)) + event
 
 def frame_bytes(message,payload=b''):
-    # 协议6沿用独立JSON前缀，Ready另携带阶段预算，不能只改握手版本。
+    # 协议7沿用独立JSON前缀，另需配对调度控制帧与回调消费确认。
     import copy
     message=copy.deepcopy(message);prefix=b''
     if message['type']=='call':
@@ -98,10 +98,17 @@ class Host:
         self.on_stream = None
         self.on_account_read = None
         self.stall_stream = False
-        self.write({'type':'hello','handshake':{'protocol_version':6,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
+        self.scheduling = {}
+        self.resident_callbacks = {}
+        self.control_events = []
+        self.defer_resumes = False
+        self.pending_resumes = []
+        self.resume_requested = threading.Event()
+        self.write_lock = threading.Lock()
+        self.write({'type':'hello','handshake':{'protocol_version':7,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
         message,_ = self.messages.get(timeout=5)
-        assert message['type'] == 'ready' and message['protocol_version'] == 6, message
+        assert message['type'] == 'ready' and message['protocol_version'] == 7, message
         self.call_budgets=message['call_budgets']
         assert self.call_budgets=={'management':120000,'maintenance':30000},message
         self.next_id = 11
@@ -111,13 +118,48 @@ class Host:
         assert len(self.routes) == len(self.registration['routes'])
         assert all(path and not path.startswith('/') for _, path in self.routes)
     def write(self, metadata, payload=b''):
-        self.process.stdin.write(frame_bytes(metadata,payload))
-        self.process.stdin.flush()
+        with self.write_lock:
+            self.process.stdin.write(frame_bytes(metadata,payload))
+            self.process.stdin.flush()
+    def control(self, msg, payload):
+        kind=msg['type']
+        if kind not in ('suspend','resume','callback_consumed'):return False
+        assert not payload,msg
+        self.control_events.append(dict(msg))
+        if kind=='callback_consumed':
+            assert msg['id']>0 and msg['id']%2==0 and msg['parent_id']%2==1,msg
+            parent=self.resident_callbacks.pop(msg['id'],None)
+            assert parent is None or parent==msg['parent_id'],msg
+            return True
+        id=msg['id'];epoch=msg['epoch']
+        if id not in self.scheduling:return True
+        phase,previous=self.scheduling[id]
+        if kind=='suspend':
+            assert phase=='running' and epoch==previous+1,msg
+            self.scheduling[id]=('suspended',epoch)
+        else:
+            assert phase=='suspended' and epoch==previous,msg
+            self.scheduling[id]=('resuming',epoch)
+            if self.defer_resumes:
+                self.pending_resumes.append((id,epoch));self.resume_requested.set()
+            else:self.grant_resume(id,epoch)
+        return True
+    def grant_resume(self,id,epoch):
+        if self.scheduling.get(id)!=('resuming',epoch):return
+        self.scheduling[id]=('running',epoch)
+        self.write({'type':'resumed','id':id,'epoch':epoch})
+    def finish_call(self,id):
+        self.scheduling.pop(id,None)
+        self.resident_callbacks={callback:parent for callback,parent in self.resident_callbacks.items() if parent!=id}
     def reader(self):
         try:
             while True:
                 frame=read_frame(self.process.stdout)
                 if frame is None:return
+                if self.control(*frame):continue
+                if frame[0]['type']=='callback':
+                    msg=frame[0];assert msg['id'] not in self.resident_callbacks,msg
+                    self.resident_callbacks[msg['id']]=msg['parent_id']
                 self.messages.put(frame)
         except Exception as error: self.messages.put(({'type':'reader_error','error':str(error)},b''))
     def callback(self, msg, body):
@@ -212,6 +254,7 @@ class Host:
         if path is not None:
             assert (method, path) in self.routes, 'request is not a registered relative route'
         id=self.next_id; self.next_id+=2
+        self.scheduling[id]=('running',0)
         params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None,'headers':[{'name':'authorization','value':list(b'fixture-admin-not-real')}]}
         self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':self.call_budgets.get(stage,5000 if stage=='registration' else 120000),'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
         while True:
@@ -219,10 +262,12 @@ class Host:
             if msg['type']=='cancel': continue
             if msg['type']=='cancelled':
                 assert msg['id']==id,msg
+                self.finish_call(id)
                 return 'cancelled',{}
             if msg['type']=='callback': self.callback(msg,payload); continue
             assert msg['type']=='result', msg
             assert msg['id']==id, msg
+            self.finish_call(id)
             if path is None:return json.loads(payload) if payload else msg['result']
             assert msg['result']['headers']==[]
             return msg['result']['status'],json.loads(payload)
@@ -277,6 +322,40 @@ class Integration(unittest.TestCase):
         history['records'][0]['detail']+='x'*gap
         self.assertEqual(len(dump(history)),size)
         self.host.states['history']['value']=history
+    def test_protocol_seven_resume_authorization_gates_callback_consumption(self):
+        self.host.defer_resumes=True
+        self.host.resume_requested.clear()
+        results=[];errors=[]
+        def run():
+            try:results.append(self.run_request('fixture-v7-resume-gate'))
+            except BaseException as error:errors.append(error)
+        worker=threading.Thread(target=run);worker.start()
+        self.assertTrue(self.host.resume_requested.wait(5))
+        self.assertTrue(worker.is_alive())
+        id,epoch=self.host.pending_resumes.pop(0)
+        self.assertEqual(self.host.scheduling[id],('resuming',epoch))
+        resident=[callback for callback,parent in self.host.resident_callbacks.items() if parent==id]
+        self.assertTrue(resident)
+        self.assertFalse(any(e['type']=='callback_consumed' and e['id'] in resident for e in self.host.control_events))
+        self.host.defer_resumes=False;self.host.grant_resume(id,epoch)
+        worker.join(10);self.assertFalse(worker.is_alive());self.assertEqual(errors,[])
+        self.assertEqual(results[0][0],200);self.assertEqual(results[0][1]['record']['status'],'correct')
+        self.assertTrue(all(any(e['type']=='callback_consumed' and e['id']==callback for e in self.host.control_events) for callback in resident))
+        self.assertEqual(self.host.resident_callbacks,{})
+    def test_protocol_seven_cancel_while_waiting_resume_allows_next_test(self):
+        self.host.defer_resumes=True;self.host.resume_requested.clear()
+        results=[];errors=[];call_id=self.host.next_id
+        def run():
+            try:results.append(self.run_request('fixture-v7-cancel-resume'))
+            except BaseException as error:errors.append(error)
+        worker=threading.Thread(target=run);worker.start()
+        self.assertTrue(self.host.resume_requested.wait(5))
+        self.host.write({'type':'cancel','id':call_id})
+        worker.join(10);self.assertFalse(worker.is_alive());self.assertEqual(errors,[])
+        self.assertEqual(results[0][0],'cancelled');self.assertEqual(self.host.resident_callbacks,{})
+        self.host.defer_resumes=False
+        status,result=self.run_request('fixture-v7-after-cancel-resume')
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
     def test_terminal_question_errors_release_account_immediately(self):
         for i,fault in enumerate(['invalid_input','timeout']):
             self.host.model_fault=fault
@@ -981,7 +1060,7 @@ class Integration(unittest.TestCase):
         self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.host.export_count,0);self.assertEqual(self.host.proxy.connects,0)
         self.assertEqual(self.host.disable_count,0)
-    def test_protocol_six_large_business_input_and_payload_remain_separate(self):
+    def test_protocol_seven_large_business_input_and_payload_remain_separate(self):
         bank=[{'id':f'custom_frame_{i}','title':'协议四','category':'数学','prompt':'x'*7999,'answer':'1'} for i in range(9)]
         status,result=self.host.call('POST','questions',{'questions':bank,'expected_version':None})
         self.assertEqual(status,400,result)
