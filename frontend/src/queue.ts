@@ -1,5 +1,5 @@
-// 每个账号串行执行题目，账号之间有界并发，停止只阻止尚未发送的任务。
-export async function runAccountQueue<A, T>(accounts: A[], tasks: T[], concurrency: number, execute: (account: A, task: T) => Promise<void>, stopped: () => boolean) {
+// 每个账号串行执行题目，账号之间有界并发；异常账号可跳过余项，不中止其他账号。
+export async function runAccountQueue<A, T>(accounts: A[], tasks: T[], concurrency: number, execute: (account: A, task: T) => Promise<void | boolean>, stopped: () => boolean) {
   let next = 0
   async function worker() {
     while (!stopped()) {
@@ -7,7 +7,7 @@ export async function runAccountQueue<A, T>(accounts: A[], tasks: T[], concurren
       if (index >= accounts.length) return
       for (const task of tasks) {
         if (stopped()) return
-        await execute(accounts[index], task)
+        if (await execute(accounts[index], task) === false) break
       }
     }
   }

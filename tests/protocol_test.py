@@ -295,13 +295,56 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.run_request('fixture-long-answer')[1]['record']['status'],'failed')
         self.host.model_answer='21'
         self.assertEqual(self.run_request('fixture-after-long-answer')[1]['record']['status'],'correct')
-    def test_parent_cancelled_question_keeps_uncertain_account_isolation(self):
+    def test_parent_cancelled_question_allows_new_operation_without_replaying_old(self):
         call_id=self.host.next_id
         self.host.on_model=lambda msg:self.host.write({'type':'cancel','id':call_id})
         self.assertEqual(self.run_request('fixture-cancel-question')[0],'cancelled')
         self.host.on_model=None
         status,result=self.run_request('fixture-after-cancel-question')
-        self.assertEqual(status,400,result);self.assertIn('隔离',result['error'])
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
+        old=next(r for r in self.host.states['history']['value']['records'] if r['id']=='fixture-cancel-question')
+        self.assertEqual(old['status'],'running');self.assertIsNone(old['finished_at_ms'])
+        before=self.host.model_count
+        replay=self.run_request('fixture-cancel-question')[1]
+        self.assertTrue(replay['replayed']);self.assertEqual(replay['record']['status'],'running')
+        self.assertEqual(self.host.model_count,before)
+    def test_repeated_parent_cancellations_do_not_exhaust_execution_slots(self):
+        for index in range(5):
+            call_id=self.host.next_id
+            self.host.on_model=lambda msg:self.host.write({'type':'cancel','id':call_id})
+            self.assertEqual(self.run_request(f'fixture-cancel-slot-{index}')[0],'cancelled')
+        self.host.on_model=None
+        status,result=self.run_request('fixture-after-cancel-slots')
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
+    def test_result_write_failure_does_not_block_new_operation(self):
+        original=self.host.callback
+        writes=0
+        def fail_result(msg,body):
+            nonlocal writes
+            if msg['method']=='host.state.put' and msg['params']['key']=='history':
+                writes+=1
+                if writes==2:
+                    self.host.write({'type':'error','id':msg['id'],'error':{'code':'conflict','message':'fixture write failed','send_state':'not_sent'}})
+                    return
+            original(msg,body)
+        self.host.callback=fail_result
+        status,result=self.run_request('fixture-result-write-failure')
+        self.assertEqual(status,400,result);self.assertIn('状态写入未确认',result['error'])
+        self.host.callback=original
+        prior=self.host.states['history']['value']['records'][-1].copy()
+        self.assertEqual(prior['status'],'running')
+        status,result=self.run_request('fixture-after-result-write-failure')
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
+        self.assertEqual(self.host.states['history']['value']['records'][0],prior)
+    def test_actually_running_account_still_rejects_overlap(self):
+        overlaps=[]
+        self.host.on_model=lambda msg:overlaps.append(self.run_request('fixture-overlap-attempt'))
+        status,result=self.run_request('fixture-active-question')
+        self.assertEqual(status,200,result)
+        self.assertEqual(overlaps[0][0],400);self.assertIn('正在执行',overlaps[0][1]['error'])
+        self.assertEqual(self.host.model_count,1)
+        self.host.on_model=None
+        self.assertEqual(self.run_request('fixture-after-active-question')[0],200)
     def new_task(self,name='第二任务',**settings):
         config={'scheduled':True,'auto_disable':False,'interval_minutes':30,'model':'fixture-model','client_key_id':'fixture-key','account_ids':['fixture-account'],'daily_max':48,'quiet_hours':None}
         config.update(settings)
@@ -1033,11 +1076,14 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.run_request('fixture-stream-failed','probe')[1]['record']['status'],'inconclusive')
         self.host.bad_stream=False
         self.assertEqual(self.run_request('fixture-after-stream','probe')[1]['record']['status'],'degraded')
-    def test_uncertain_host_question_still_keeps_isolation(self):
+    def test_unconfirmed_question_history_does_not_block_new_operation(self):
         self.run_request('fixture-prior-question')
         prior=self.host.states['history']['value']['records'][-1]
         prior['status']='running';prior['finished_at_ms']=None
-        self.assertEqual(self.run_request('fixture-after-question','probe')[0],400)
+        status,result=self.run_request('fixture-after-question')
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
+        self.assertEqual(prior['status'],'running');self.assertIsNone(prior['finished_at_ms'])
+        self.assertEqual(self.run_request('fixture-after-question-probe','probe')[0],200)
     def test_interrupted_local_probe_history_does_not_block_new_operation(self):
         self.run_request('fixture-prior-probe','probe')
         prior=self.host.states['history']['value']['records'][-1]

@@ -22,3 +22,22 @@ test('CSV防公式注入与正确转义', () => {
   assert.equal(csvCell('a"b'), '"a""b"')
   assert.equal(csvCell(null), '""')
 })
+
+test('账号请求异常仅跳过该账号余项，串行继续其他账号', async () => {
+  const sent = []
+  await runAccountQueue(['a','b','c'], [1,2], 1, async (account, task) => {
+    sent.push([account, task])
+    if (account === 'a') return false
+  }, () => false)
+  assert.deepEqual(sent, [['a',1], ['b',1], ['b',2], ['c',1], ['c',2]])
+})
+test('并发账号异常不停止其他worker或后续账号', async () => {
+  const sent = []
+  await runAccountQueue(['a','b','c'], [1,2], 2, async (account, task) => {
+    sent.push([account, task])
+    await new Promise(resolve => setImmediate(resolve))
+    if (account === 'a') return false
+  }, () => false)
+  assert.deepEqual(sent.filter(([account]) => account === 'a'), [['a',1]])
+  for (const account of ['b','c']) assert.deepEqual(sent.filter(([id]) => id === account), [[account,1],[account,2]])
+})

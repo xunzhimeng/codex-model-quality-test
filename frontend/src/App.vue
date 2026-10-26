@@ -68,6 +68,7 @@ async function run() {
   const tasks = mode.value === 'probe' ? [null] : [...selectedQuestions.value]
   const settings = { mode: mode.value, model: model.value.trim(), effort: mode.value === 'probe' ? 'default' : effort.value, client_key_id: key.value }
   batchId.value = crypto.randomUUID(); const id = batchId.value; total.value = accounts.length * tasks.length; completed.value = 0
+  let interruptedAccounts = 0
   running.value = true; stopping.value = false
   try {
     await runAccountQueue(accounts, tasks, Math.max(1, Math.min(4, concurrency.value)), async (account: Account, question: string | null) => {
@@ -75,12 +76,16 @@ async function run() {
       try {
         const result = await request<{ record: TestRecord }>('run', { id: operation, batch_id: id, account_id: account.id, ...settings, question_id: question })
         upsert(result.record)
-        if (result.record.status === 'running') { stopping.value = true; error.value = '测试结果未确认，请刷新历史后再操作' }
+        if (result.record.status === 'running') {
+          interruptedAccounts++; error.value = `${account.name}：测试结果未确认，请刷新历史；可重新发起测试`
+          return false
+        }
       } catch (e) {
-        stopping.value = true; error.value = `${(e as Error).message}，操作ID ${operation}，未自动重试`
+        interruptedAccounts++; error.value = `${account.name}：${(e as Error).message}，操作ID ${operation}，未自动重试`
+        return false
       } finally { completed.value++ }
     }, () => stopping.value)
-    notice.value = stopping.value ? '已停止后续任务，已发送的测试不会自动重试' : `本批次已完成 ${completed.value} 项测试`
+    notice.value = stopping.value ? '已停止后续任务，已发送的测试不会自动重试' : interruptedAccounts ? `本批次已结束，已处理 ${completed.value} / ${total.value} 项，异常账号已跳过后续题目` : `本批次已完成 ${completed.value} 项测试`
     await refreshHistory()
     catalog.value = await request<Catalog>('catalog')
   } catch (e) { error.value = (e as Error).message } finally { running.value = false }

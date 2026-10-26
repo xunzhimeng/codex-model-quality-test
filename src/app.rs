@@ -55,24 +55,6 @@ impl Drop for AccountGuard {
     }
 }
 
-// 仅宿主模型调用未收到关联终态时保留隔离，解析失败和明确终态错误直接释放。
-struct PendingAccount {
-    guard: Option<(AccountGuard, tokio::sync::OwnedSemaphorePermit)>,
-    quarantine: bool,
-}
-impl Drop for PendingAccount {
-    fn drop(&mut self) {
-        if self.quarantine
-            && let Some(guard) = self.guard.take()
-        {
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(150)).await;
-                drop(guard);
-            });
-        }
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
@@ -308,7 +290,7 @@ impl App {
         {
             let mut accounts = self.accounts.lock().map_err(|_| "账号测试锁不可用")?;
             if !accounts.insert(request.account_id.clone()) {
-                return Err("该账号已有测试或未确认调用隔离尚未结束，请稍后再测".into());
+                return Err("该账号正在执行测试，请等待当前测试结束".into());
             }
         }
         let _account = AccountGuard {
@@ -390,14 +372,7 @@ impl App {
             if let Some(record) = history.records.iter().find(|r| r.id == request.id) {
                 return json_response(200, &json!({"record":record,"replayed":true}));
             }
-            if history.records.iter().any(|r| {
-                r.account_id == request.account_id
-                    && r.mode == "question"
-                    && r.status == "running"
-                    && started.saturating_sub(r.started_at_ms) < 150_000
-            }) {
-                return Err("该账号有未确认测试，请稍后查询历史".into());
-            }
+            // 历史只用于同操作ID去重，不代表当前会话仍有调用；实际并发由账号锁控制。
             history.append(record.clone())?;
             if let Some(generation) = &monitor_generation
                 && !self.monitor.begin(host, &request, generation).await?
@@ -406,14 +381,12 @@ impl App {
             }
             store::put(host, "history", &history, version).await?;
         }
-        let mut pending = PendingAccount {
-            guard: Some((_account, _slot)),
-            quarantine: false,
-        };
+        // 账号锁与并发槽仅覆盖当前处理；父调用结束时宿主会撤销其模型回调。
+        // 未确认历史保留审计与同ID去重，不额外占用新测试的执行资格。
         let outcome = if let Some(q) = question {
             tokio::time::timeout(
                 Duration::from_secs(timeout_seconds),
-                execute_question(host, &request, &q, &mut pending.quarantine),
+                execute_question(host, &request, &q),
             )
             .await
             .unwrap_or_else(|_| Err("测试超时，无法判断，未自动重试".into()))
@@ -473,7 +446,6 @@ async fn execute_question(
     host: &HostClient,
     request: &RunRequest,
     question: &Question,
-    quarantine: &mut bool,
 ) -> Result<Outcome, String> {
     let mut body = json!({"model":request.model,"input":question.prompt,"store":false});
     if request.effort != "default" {
@@ -490,19 +462,13 @@ async fn execute_question(
     };
     let params = serde_json::to_value(metadata).map_err(|_| "模型请求编码失败")?;
     let payload = serde_json::to_vec(&body).map_err(|_| "题目正文编码失败")?;
-    // 只有未收到关联终态时保留隔离，评分/解析失败不代表模型仍在执行。
-    *quarantine = true;
     let reply = match host.call("host.model.execute", params, payload).await {
-        Ok(reply) => {
-            *quarantine = false;
-            reply
-        }
+        Ok(reply) => reply,
         Err(SessionError::Remote(_)) => {
-            *quarantine = false;
             return Err("宿主已结束模型调用并返回错误，请核对Key范围、模型、账号与额度".into());
         }
         Err(_) => {
-            return Err("模型调用结果未确认，请核对历史；账号暂保留150秒隔离，未自动重试".into());
+            return Err("模型调用结果未确认，请核对历史；未自动重试，可重新发起测试".into());
         }
     };
     let events = ModelEventBatch::decode(&reply.payload).map_err(|_| "模型事件格式无效")?;
