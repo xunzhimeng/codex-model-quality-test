@@ -8,12 +8,20 @@ mod questions;
 mod store;
 
 use gateway_plugin_sdk::{
+    CallBudgets, Stage,
     call::management::{
         ManagementPage, ManagementRegistration, ManagementResource, ManagementRoute,
     },
     client::{Empty, PluginBuilder, PluginSession, SessionConfig, TypedReply, methods},
 };
 use std::sync::Arc;
+
+fn call_budgets() -> CallBudgets {
+    // 协议6由插件声明入口预算，保持既有手动/后台上限并留出状态回写时间。
+    [(Stage::Management, 120_000), (Stage::Maintenance, 30_000)]
+        .into_iter()
+        .collect()
+}
 
 fn registration() -> ManagementRegistration {
     ManagementRegistration {
@@ -96,14 +104,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?
         .build()?;
-    PluginSession::accept(
+    let mut session = PluginSession::accept(
         tokio::io::stdin(),
         tokio::io::stdout(),
         SessionConfig::default(),
     )
-    .await?
-    .run(plugin)
     .await?;
+    session.set_call_budgets(call_budgets())?;
+    session.run(plugin).await?;
     Ok(())
 }
 
@@ -116,7 +124,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../plugin.json")).unwrap();
         assert_eq!(source["manifestVersion"], 2);
         assert!(source.get("permissions").is_none());
-        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.29.7");
+        assert_eq!(source["engines"]["codex-proxy-rs"], ">=3.32.0");
         assert_eq!(source["version"], env!("CARGO_PKG_VERSION"));
         let manifest =
             gateway_plugin_sdk::Manifest::from_author_slice(include_bytes!("../plugin.json"))
@@ -131,9 +139,25 @@ mod tests {
         assert_eq!(source["contributes"]["management"]["version"], 2);
         assert_eq!(manifest.state[0].schema_version, 1);
         assert_eq!(manifest.state[0].namespace, "quality");
-        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 5);
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 6);
     }
 
+    #[test]
+    fn declared_budgets_keep_existing_entry_deadlines() {
+        let declarations = call_budgets();
+        let resolved = gateway_plugin_sdk::ResolvedCallBudgets::resolve(&declarations).unwrap();
+        assert_eq!(resolved.budget(Stage::Management).as_millis(), 120_000);
+        assert_eq!(resolved.budget(Stage::Maintenance).as_millis(), 30_000);
+        assert_eq!(
+            resolved.source(Stage::Management),
+            gateway_plugin_sdk::CallBudgetSource::Plugin
+        );
+        assert_eq!(resolved.budget(Stage::Registration).as_millis(), 5_000);
+        assert_eq!(
+            resolved.source(Stage::Registration),
+            gateway_plugin_sdk::CallBudgetSource::Default
+        );
+    }
     #[test]
     fn management_paths_are_relative() {
         // 管理路径挂在实例命名空间下，前导斜杠会被宿主作为空路径段拒绝。

@@ -26,7 +26,7 @@ def events(answer='21'):
     return b'HME1' + struct.pack('>II', 1, len(event)) + event
 
 def frame_bytes(message,payload=b''):
-    # 协议5沿用独立JSON前缀，不能只改握手版本而忽略回调合同。
+    # 协议6沿用独立JSON前缀，Ready另携带阶段预算，不能只改握手版本。
     import copy
     message=copy.deepcopy(message);prefix=b''
     if message['type']=='call':
@@ -98,10 +98,12 @@ class Host:
         self.on_stream = None
         self.on_account_read = None
         self.stall_stream = False
-        self.write({'type':'hello','handshake':{'protocol_version':5,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
+        self.write({'type':'hello','handshake':{'protocol_version':6,'artifact_sha256':'0'*64,'plugin_id':'xunzhimeng.model-quality-test','instance_id':'fixture','generation':1,'incarnation':'fixture-1','configuration':{},'contributes':{'maintenance':{'id':'xunzhimeng.model-quality-test.maintenance','version':1,'stages':['maintenance']},'management':{'id':'xunzhimeng.model-quality-test.management','version':2,'stages':['management']}}}})
         threading.Thread(target=self.reader, daemon=True).start()
         message,_ = self.messages.get(timeout=5)
-        assert message['type'] == 'ready' and message['protocol_version'] == 5, message
+        assert message['type'] == 'ready' and message['protocol_version'] == 6, message
+        self.call_budgets=message['call_budgets']
+        assert self.call_budgets=={'management':120000,'maintenance':30000},message
         self.next_id = 11
         self.registration = self.call('management.register', stage='registration')
         # 先检查相对路由，再按注册表分发，避免桩直接接受宿主会拒绝的路径。
@@ -211,7 +213,7 @@ class Host:
             assert (method, path) in self.routes, 'request is not a registered relative route'
         id=self.next_id; self.next_id+=2
         params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None,'headers':[{'name':'authorization','value':list(b'fixture-admin-not-real')}]}
-        self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':30000 if stage=='maintenance' else 120000,'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
+        self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':self.call_budgets.get(stage,5000 if stage=='registration' else 120000),'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
         while True:
             msg,payload=self.messages.get(timeout=35)
             if msg['type']=='cancel': continue
@@ -915,7 +917,28 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.host.states['history'],old['history'])
         self.assertEqual(self.host.states['bank'],old['bank'])
         self.assertEqual(self.task_state()['accounts']['fixture-account']['total_runs'],1)
-    def test_protocol_five_large_business_input_and_payload_remain_separate(self):
+    def test_v071_task_registry_survives_sdk_upgrade_without_extra_execution(self):
+        import copy
+        self.configure_monitor(auto_disable=False)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.control(True)
+        self.new_task('升级保留任务',scheduled=False,auto_disable=False)
+        self.host.call('POST','questions',{'questions':[{'id':'custom_upgrade','title':'保留题目','category':'数学','prompt':'1+1','answer':'2'}],'expected_version':None})
+        old=copy.deepcopy(self.host.states)
+        self.host.close();self.host=Host();self.host.states=copy.deepcopy(old)
+        snapshot=self.host.call('GET','monitor')[1]
+        self.assertEqual(len(snapshot['tasks']),2)
+        self.assertEqual(snapshot['total_runs'],1)
+        self.assertTrue(snapshot['tasks'][0]['state']['paused'])
+        self.assertFalse(snapshot['tasks'][1]['state']['settings']['scheduled'])
+        self.assertEqual([t['id'] for t in snapshot['tasks']],[t['id'] for t in old['monitor']['value']['tasks']])
+        self.assertEqual(self.host.states['monitor'],old['monitor'])
+        self.assertEqual(self.host.states['history'],old['history'])
+        self.assertEqual(self.host.states['bank'],old['bank'])
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.export_count,0);self.assertEqual(self.host.proxy.connects,0)
+        self.assertEqual(self.host.disable_count,0)
+    def test_protocol_six_large_business_input_and_payload_remain_separate(self):
         bank=[{'id':f'custom_frame_{i}','title':'协议四','category':'数学','prompt':'x'*7999,'answer':'1'} for i in range(9)]
         status,result=self.host.call('POST','questions',{'questions':bank,'expected_version':None})
         self.assertEqual(status,400,result)

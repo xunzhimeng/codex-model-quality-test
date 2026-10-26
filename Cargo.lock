@@ -158,7 +158,7 @@ dependencies = [
 [[package]]
 name = "gateway-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=78bc57c5cf24b01a38e985cdd739bb4ae89ce11f#78bc57c5cf24b01a38e985cdd739bb4ae89ce11f"
+source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=6a5300a7b5c649f2a6d548df70ccdd58d15e0025#6a5300a7b5c649f2a6d548df70ccdd58d15e0025"
 dependencies = [
  "base64 0.23.1",
  "semver",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "model-quality-test"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "gateway-plugin-sdk",
  "reqwest",
