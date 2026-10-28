@@ -432,10 +432,24 @@ impl Monitor {
         let _guard = self.lock.lock().await;
         let (registry, version) = self.load(host).await?;
         let now = now_ms();
+        let (history, _) = store::get::<crate::store::History>(host, "history").await?;
         let tasks: Vec<_> = registry
             .tasks
             .iter()
-            .map(|t| Self::task_snapshot(t, now))
+            .map(|task| {
+                let mut snapshot = Self::task_snapshot(task, now);
+                // 结果详情由历史唯一持有，监控只按凭证投影，避免额外持久化和容量膨胀。
+                for (id, status) in &task.state.accounts {
+                    if let Some(record) = history.records.iter().find(|r| {
+                        r.id == status.last_record_id
+                            && &r.account_id == id
+                            && r.status == status.last_status
+                    }) {
+                        snapshot["state"]["accounts"][id]["last_result"] = json!(record);
+                    }
+                }
+                snapshot
+            })
             .collect();
         let total: u64 = tasks.iter().filter_map(|t| t["total_runs"].as_u64()).sum();
         let today: u64 = tasks.iter().filter_map(|t| t["daily_runs"].as_u64()).sum();

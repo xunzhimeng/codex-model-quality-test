@@ -464,8 +464,24 @@ async fn execute_question(
     let payload = serde_json::to_vec(&body).map_err(|_| "题目正文编码失败")?;
     let reply = match host.call("host.model.execute", params, payload).await {
         Ok(reply) => reply,
-        Err(SessionError::Remote(_)) => {
-            return Err("宿主已结束模型调用并返回错误，请核对Key范围、模型、账号与额度".into());
+        Err(SessionError::Remote(fault)) => {
+            // 宿主错误可能携带原始请求细节，只展示状态码、合同错误码与本地安全说明。
+            let reason = match fault.code {
+                gateway_plugin_sdk::ErrorCode::Timeout => "模型调用超时",
+                gateway_plugin_sdk::ErrorCode::PermissionDenied => "Key或账号权限被拒绝",
+                gateway_plugin_sdk::ErrorCode::Capacity => "宿主执行容量不足",
+                gateway_plugin_sdk::ErrorCode::InvalidInput => "请求参数或模型无效",
+                _ => "请核对Key范围、模型、账号与额度",
+            };
+            let code = serde_json::to_value(fault.code).map_err(|_| "宿主错误码无效")?;
+            let http = fault
+                .http_status
+                .map(|s| format!("，HTTP {s}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "宿主已结束模型调用：{reason}（{}{http}）",
+                code.as_str().unwrap_or("unknown")
+            ));
         }
         Err(_) => {
             return Err("模型调用结果未确认，请核对历史；未自动重试，可重新发起测试".into());

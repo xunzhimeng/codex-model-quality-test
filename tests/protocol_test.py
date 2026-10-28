@@ -82,6 +82,7 @@ class Host:
         self.ticket_second = 'ticket-new'
         self.model_answer = '21'
         self.model_fault = None
+        self.model_http_status = None
         self.model_bad_payload = False
         self.on_model = None
         self.bad_stream = False
@@ -91,6 +92,7 @@ class Host:
         self.disable_count = 0
         self.dispatch_status = 200
         self.http_status = 200
+        self.http_responses = []
         self.error_body = None
         self.fail_disable = False
         self.body_streams = {}
@@ -208,7 +210,7 @@ class Host:
             self.model_count+=1
             if self.on_model:self.on_model(msg)
             if self.model_fault:
-                self.write({'type':'error','id':msg['id'],'error':{'code':self.model_fault,'message':'fixture model failure','send_state':'sent'}})
+                self.write({'type':'error','id':msg['id'],'error':{'code':self.model_fault,'message':'fixture model failure fixture-secret','send_state':'sent','http_status':self.model_http_status}})
                 return
             if self.model_bad_payload:payload=b'invalid model batch'
             else:payload=events(self.model_answer)
@@ -356,6 +358,12 @@ class Integration(unittest.TestCase):
         self.host.defer_resumes=False
         status,result=self.run_request('fixture-v7-after-cancel-resume')
         self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
+    def test_question_error_displays_host_status_without_plugin_retry_or_secret(self):
+        self.host.model_fault='upstream';self.host.model_http_status=429
+        record=self.run_request('fixture-question-status')[1]['record']
+        self.assertEqual(record['status'],'failed');self.assertIn('HTTP 429',record['detail'])
+        self.assertIn('upstream',record['detail']);self.assertNotIn('fixture-secret',dump(record).decode())
+        self.assertEqual(self.host.model_count,1)
     def test_terminal_question_errors_release_account_immediately(self):
         for i,fault in enumerate(['invalid_input','timeout']):
             self.host.model_fault=fault
@@ -709,7 +717,10 @@ class Integration(unittest.TestCase):
         state=self.task_state()['accounts']['fixture-account']
         self.assertEqual(state['total_runs'],2);self.assertEqual(state['streak'],0)
         self.assertIsNone(state['confirm_due_ms']);self.assertEqual(self.host.disable_count,0)
-        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,3)
+        # 确认测试内部重试3次，仍只计1轮确认；后续tick不再追加确认。
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(record['metrics']['attempt_count'],3)
+        self.host.call('plugin.reconcile',stage='maintenance');self.assertEqual(self.host.proxy.connects,5)
     def test_policy_change_discards_old_confirmation_and_keeps_counts(self):
         self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
         self.assertIsNotNone(self.task_state()['accounts']['fixture-account']['confirm_due_ms'])
@@ -929,7 +940,12 @@ class Integration(unittest.TestCase):
         self.host.call('plugin.reconcile',stage='maintenance')
         elapsed=time.monotonic()-started;self.assertGreaterEqual(elapsed,17);self.assertLess(elapsed,29)
         record=self.host.states['history']['value']['records'][-1]
-        self.assertEqual(record['status'],'inconclusive');self.assertGreaterEqual(record['metrics']['rounds'][0]['elapsed_ms'],17000)
+        self.assertEqual(record['status'],'inconclusive')
+        self.assertEqual(record['metrics']['attempt_count'],3)
+        self.assertEqual(record['metrics']['failure']['kind'],'timeout')
+        self.assertGreaterEqual(record['metrics']['rounds'][0]['elapsed_ms'],5900)
+        self.assertLessEqual(record['metrics']['rounds'][0]['elapsed_ms'],6500)
+        self.assertEqual(record['metrics']['retry_stop'],'max_attempts')
         self.assertEqual(self.task_state()['accounts']['fixture-account']['streak'],0)
         self.assertEqual(self.host.disable_count,0)
         self.host.stall_stream=False
@@ -1086,8 +1102,11 @@ class Integration(unittest.TestCase):
         self.assertEqual(result['record']['metrics']['client_key_id'],'fixture-key');self.assertFalse(result['record']['metrics']['key_billed'])
     def test_failed_stream_is_inconclusive(self):
         self.host.bad_stream=True
-        self.assertEqual(self.run_request('fixture-failed','probe')[1]['record']['status'],'inconclusive')
-        self.assertEqual(len(self.host.http),1)
+        record=self.run_request('fixture-failed','probe')[1]['record']
+        self.assertEqual(record['status'],'inconclusive')
+        self.assertEqual(record['metrics']['failure']['kind'],'stream_error')
+        self.assertEqual(record['metrics']['attempt_count'],3)
+        self.assertEqual(len(self.host.http),3)
     def test_parent_cancel_releases_probe_account_without_replay(self):
         # 在上游请求已抵达本机代理时取消真实父调用，不能用改写历史代替取消验证。
         self.host.stall_stream=True
@@ -1168,6 +1187,104 @@ class Integration(unittest.TestCase):
         prior=self.host.states['history']['value']['records'][-1]
         prior['status']='running';prior['finished_at_ms']=None
         self.assertEqual(self.run_request('fixture-after-interrupted','probe')[0],200)
+    def test_transient_probe_errors_retry_twice_then_succeed_without_reusing_ticket(self):
+        self.host.http_responses=[{}, {'status':503}, {'status':429,'error':{'error':{'code':'rate_limit_exceeded'}},'headers':{'Retry-After':'0'}}]
+        record=self.run_request('fixture-probe-retry-success','probe')[1]['record']
+        self.assertEqual(record['status'],'degraded')
+        self.assertEqual(record['metrics']['attempt_count'],3)
+        self.assertNotIn('failure',record['metrics'])
+        self.assertEqual(self.host.export_count,1);self.assertEqual(len(self.host.identity_snapshots),1)
+        self.assertEqual([r['attempt'] for r in record['metrics']['rounds']],[1,1,2,3,3])
+        self.assertNotIn('x-codex-turn-state',self.host.http[2]);self.assertNotIn('x-codex-turn-state',self.host.http[3])
+        self.assertNotIn('cookie',self.host.http[2]);self.assertNotIn('cookie',self.host.http[3])
+    def test_retriable_failure_stops_after_three_attempts_with_exact_http_status(self):
+        self.host.http_status=503
+        record=self.run_request('fixture-probe-retry-limit','probe')[1]['record']
+        self.assertEqual(record['status'],'inconclusive');self.assertEqual(record['metrics']['attempt_count'],3)
+        self.assertEqual(record['metrics']['retry_stop'],'max_attempts')
+        self.assertEqual(record['metrics']['failure']['http_status'],503)
+        self.assertIn('HTTP 503',record['detail']);self.assertNotIn('无法判断',record['detail'])
+        self.assertEqual(self.host.proxy.connects,3)
+    def test_nonretriable_errors_do_not_repeat_or_expose_upstream_secrets(self):
+        for index,(status,code,kind) in enumerate([(401,'invalid_token','authentication'),(403,'fixture_unknown','permission_denied'),(400,'unsupported_parameter','invalid_request'),(400,'model_not_found','model_unavailable'),(429,'insufficient_quota','quota_exhausted')]):
+            self.host.http_status=status;self.host.error_body={'error':{'code':code,'message':'fixture-token-not-real fixture-password'}}
+            before=self.host.proxy.connects
+            record=self.run_request(f'fixture-probe-no-retry-{index}','probe')[1]['record']
+            self.assertEqual(record['metrics']['failure']['kind'],kind)
+            self.assertEqual(record['metrics']['failure']['http_status'],status)
+            self.assertEqual(record['metrics']['attempt_count'],1)
+            self.assertEqual(record['metrics']['retry_stop'],'not_retryable')
+            self.assertEqual(self.host.proxy.connects,before+1)
+            self.assertNotIn('fixture-password',dump(record).decode());self.assertNotIn('fixture-token-not-real',dump(record).decode())
+    def test_retry_after_exceeding_budget_is_not_ignored(self):
+        self.host.http_responses=[{'status':429,'headers':{'Retry-After':'120'},'error':{'error':{'code':'rate_limit_exceeded'}}}]
+        record=self.run_request('fixture-probe-long-retry-after','probe')[1]['record']
+        self.assertEqual(record['metrics']['attempt_count'],1)
+        self.assertEqual(record['metrics']['retry_stop'],'retry_after_exceeds_budget')
+        self.assertEqual(record['metrics']['failure']['retry_after_ms'],120000)
+        self.assertEqual(record['metrics']['failure']['http_status'],429)
+    def test_http_429_body_timeout_keeps_retry_after_and_does_not_retry_early(self):
+        self.configure_monitor(auto_disable=True)
+        self.host.http_responses=[{'status':429,'headers':{'Retry-After':'120'},'stall_body':True}]
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(record['metrics']['attempt_count'],1)
+        self.assertEqual(record['metrics']['failure']['http_status'],429)
+        self.assertEqual(record['metrics']['failure']['retry_after_ms'],120000)
+        self.assertEqual(record['metrics']['retry_stop'],'retry_after_exceeds_budget')
+        self.assertEqual(self.host.proxy.connects,1);self.assertEqual(self.host.disable_count,0)
+    def test_retry_after_wait_is_observed_before_success(self):
+        self.host.http_responses=[{'status':429,'headers':{'Retry-After':'1'}}]
+        start=time.monotonic()
+        record=self.run_request('fixture-probe-wait-retry-after','probe')[1]['record']
+        self.assertGreaterEqual(time.monotonic()-start,1)
+        self.assertEqual(record['metrics']['attempt_count'],2);self.assertEqual(record['status'],'degraded')
+    def test_background_timeout_retries_then_succeeds_and_counts_run_once(self):
+        self.configure_monitor(auto_disable=True,daily_max=1)
+        self.host.http_responses=[{'stall':True}]
+        self.due();start=time.monotonic();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertGreaterEqual(time.monotonic()-start,6);self.assertLess(time.monotonic()-start,18)
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(record['status'],'degraded');self.assertEqual(record['metrics']['attempt_count'],2)
+        self.assertEqual(record['metrics']['attempts'][0]['failure']['kind'],'timeout')
+        self.assertEqual(self.monitor_snapshot()['daily_runs'],1);self.assertEqual(self.host.disable_count,0)
+    def test_background_retry_failure_is_projected_without_persisting_duplicate_result(self):
+        self.configure_monitor(auto_disable=True)
+        self.host.http_status=503;self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        snapshot=self.monitor_snapshot();status=snapshot['state']['accounts']['fixture-account']
+        self.assertEqual(status['last_result']['metrics']['failure']['http_status'],503)
+        self.assertEqual(status['last_result']['metrics']['attempt_count'],3)
+        self.assertEqual(snapshot['daily_runs'],1);self.assertEqual(self.host.disable_count,0)
+        self.assertNotIn('last_result',self.task_state()['accounts']['fixture-account'])
+        self.host.states['history']['value']['records']=[]
+        self.assertNotIn('last_result',self.monitor_snapshot()['state']['accounts']['fixture-account'])
+    def test_sse_specific_errors_keep_reason_and_retry_policy(self):
+        self.host.http_responses=[{'body':b'data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}\n\n'}]
+        record=self.run_request('fixture-probe-sse-retry','probe')[1]['record']
+        self.assertEqual(record['status'],'degraded');self.assertEqual(record['metrics']['attempt_count'],2)
+        self.host.http_responses=[{'body':b'data: {"type":"response.failed","response":{"error":{"code":"invalid_token"}}}\n\n'}]
+        record=self.run_request('fixture-probe-sse-auth','probe')[1]['record']
+        self.assertEqual(record['metrics']['failure']['kind'],'authentication');self.assertEqual(record['metrics']['attempt_count'],1)
+    def test_cancelling_retry_wait_does_not_send_another_attempt(self):
+        call_id=self.host.next_id
+        self.host.http_responses=[{'status':429,'headers':{'Retry-After':'3'}}]
+        timers=[]
+        def cancel_during_wait():
+            timer=threading.Timer(0.15,lambda:self.host.write({'type':'cancel','id':call_id}))
+            timers.append(timer);timer.start()
+        self.host.on_stream=cancel_during_wait
+        self.assertEqual(self.run_request('fixture-probe-cancel-wait','probe')[0],'cancelled')
+        self.host.on_stream=None
+        for timer in timers:timer.join()
+        self.assertEqual(self.host.proxy.connects,1)
+        status,result=self.run_request('fixture-probe-after-cancel-wait','probe')
+        self.assertEqual(status,200,result);self.assertEqual(result['record']['metrics']['attempt_count'],1)
+        self.assertEqual(self.host.proxy.connects,3)
+    def test_missing_ticket_retries_without_fabricating_a_success(self):
+        self.host.http_responses=[{'ticket':''} for _ in range(3)]
+        record=self.run_request('fixture-probe-no-ticket','probe')[1]['record']
+        self.assertEqual(record['metrics']['failure']['kind'],'missing_ticket');self.assertEqual(record['metrics']['attempt_count'],3)
+        self.assertEqual(record['status'],'inconclusive')
     def test_custom_bank_compare_and_swap(self):
         q={'id':'custom_sum','title':'加法','category':'数学','prompt':'17+28，只输出整数','answer':'45'}
         self.assertEqual(self.host.call('POST','questions',{'questions':[q],'expected_version':None})[0],200)

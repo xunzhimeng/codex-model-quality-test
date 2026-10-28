@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { request, type Account, type Catalog, type History, type Question, type TestRecord } from './api'
 import { csvCell, runAccountQueue } from './queue'
 import { useModels } from './models'
+import { resultView } from './result'
 import MonitorPanel from './MonitorPanel.vue'
 import ProbeDetails from './ProbeDetails.vue'
 const catalog = ref<Catalog>({ accounts: [], keys: [], questions: [], bank_version: null, version: '' })
@@ -29,18 +30,17 @@ const visibleAccounts = computed(() => catalog.value.accounts.filter(a => !accou
 const displayedRecords = computed(() => tab.value === 'new' ? records.value.filter(r => r.batch_id === batchId.value) : records.value)
 const selectedQuestion = computed(() => catalog.value.questions.find(q => q.id === selectedQuestions.value[0]))
 const comparison = computed(() => {
-  const map = new Map<string, { id: string; name: string; correct: number; wrong: number; failed: number; pending: number; latency: number; count: number; probe: string }>()
+  const map = new Map<string, { id: string; name: string; correct: number; wrong: number; failed: number; pending: number; latency: number; count: number; probe: TestRecord | null }>()
   for (const r of displayedRecords.value) {
     let row = map.get(r.account_id)
-    if (!row) { row = { id: r.account_id, name: accountName(r.account_id, r.account_name), correct: 0, wrong: 0, failed: 0, pending: 0, latency: 0, count: 0, probe: '—' }; map.set(r.account_id, row) }
-    if (r.mode === 'probe') { if (row.probe === '—') row.probe = label(r.status) }
+    if (!row) { row = { id: r.account_id, name: accountName(r.account_id, r.account_name), correct: 0, wrong: 0, failed: 0, pending: 0, latency: 0, count: 0, probe: null }; map.set(r.account_id, row) }
+    if (r.mode === 'probe') { if (!row.probe) row.probe = r }
     else { if (r.status === 'correct') row.correct++; if (r.status === 'wrong') row.wrong++; if (r.status === 'failed') row.failed++; if (r.status === 'running') row.pending++ }
     if (r.latency_ms !== null) { row.latency += r.latency_ms; row.count++ }
   }
   return Array.from(map.values())
 })
 function accountName(id: string, historical: string) { return catalog.value.accounts.find(a => a.id === id)?.name || historical || id }
-function label(status: string) { return ({ correct: '答对', wrong: '答错', failed: '调用失败', running: '结果未确认', healthy: '未发现降级', degraded: '疑似降级', inconclusive: '无法判断' } as Record<string, string>)[status] || status }
 function seconds(ms: number | null) { return ms === null ? '—' : `${(ms / 1000).toFixed(2)} s` }
 function time(ms: number) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }) }
 function upsert(record: TestRecord) { const i = records.value.findIndex(r => r.id === record.id); if (i === -1) records.value.unshift(record); else records.value[i] = record }
@@ -81,11 +81,11 @@ async function run() {
           return false
         }
       } catch (e) {
-        interruptedAccounts++; error.value = `${account.name}：${(e as Error).message}，操作ID ${operation}，未自动重试`
+        interruptedAccounts++; error.value = `${account.name}：${(e as Error).message}，操作ID ${operation}，未重新提交测试`
         return false
       } finally { completed.value++ }
     }, () => stopping.value)
-    notice.value = stopping.value ? '已停止后续任务，已发送的测试不会自动重试' : interruptedAccounts ? `本批次已结束，已处理 ${completed.value} / ${total.value} 项，异常账号已跳过后续题目` : `本批次已完成 ${completed.value} 项测试`
+    notice.value = stopping.value ? '已停止后续任务，已发送的请求不撤回' : interruptedAccounts ? `本批次已结束，已处理 ${completed.value} / ${total.value} 项，异常账号已跳过后续题目` : `本批次已完成 ${completed.value} 项测试`
     await refreshHistory()
     catalog.value = await request<Catalog>('catalog')
   } catch (e) { error.value = (e as Error).message } finally { running.value = false }
@@ -105,7 +105,7 @@ function download(format: 'json' | 'csv') {
   if (format === 'json') content = JSON.stringify({ exported_at: new Date().toISOString(), records: list }, null, 2)
   else {
     const headers = ['时间', '批次', '账号', '模式', '题目', '模型', '思考强度', '结果', '耗时毫秒', '回答', '标准答案', '详情']
-    const rows = list.map(r => [time(r.started_at_ms), r.batch_id, accountName(r.account_id, r.account_name), r.mode, r.question_title, r.model, r.effort, label(r.status), r.latency_ms, r.answer, r.expected, r.detail])
+    const rows = list.map(r => [time(r.started_at_ms), r.batch_id, accountName(r.account_id, r.account_name), r.mode, r.question_title, r.model, r.effort, resultView(r).label, r.latency_ms, r.answer, r.expected, r.detail])
     content = '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n')
   }
   const url = URL.createObjectURL(new Blob([content], { type: format === 'json' ? 'application/json' : 'text/csv;charset=utf-8' }))
@@ -127,7 +127,7 @@ onMounted(reload)
     <template v-if="tab === 'new'">
       <section class="panel">
         <div class="section-head"><nav class="segments" aria-label="测试类型"><button :class="{ active: mode === 'question' }" :disabled="running" @click="mode = 'question'">题目测试</button><button :class="{ active: mode === 'probe' }" :disabled="running" @click="mode = 'probe'; changeMode()">探针测试</button></nav>
-          <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>账号未配置代理或代理失败时停止，不回退直连；令牌须在宿主刷新<br>Key仅限定范围，不经过Key计费／额度／租约链，探针模型使用实际上游名称且须在Key可见范围<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链</template></div></details>
+          <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>仅可重试故障自动重试，含初次最多3次；总计最多90秒，每次最多30秒，每次从首轮开始<br>账号须配置代理，代理失败不回退直连；令牌须在宿主刷新<br>Key仅限定范围，不经过Key计费／额度／租约链，探针模型使用实际上游名称且须在Key可见范围<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链，不自动重试</template></div></details>
         </div>
         <div v-if="mode === 'probe'" class="alert warning">探针按所选Key限定账号与模型范围，强制使用账号代理，不计入Key账单 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
         <fieldset :disabled="running || loading">
@@ -158,15 +158,15 @@ onMounted(reload)
     <template v-else-if="tab !== 'monitor'">
       <section v-if="comparison.length" class="panel">
         <div class="section-head"><strong>账号对比</strong><span class="muted">正确率仅统计已评分题目，历史页汇总当前保留记录</span></div>
-        <div class="table-wrap"><table><thead><tr><th>账号</th><th>答对 / 已评分</th><th>正确率</th><th>调用失败</th><th>未确认</th><th>平均耗时</th><th>最近探针</th></tr></thead><tbody><tr v-for="row in comparison" :key="row.id"><td>{{ row.name }}</td><td>{{ row.correct }} / {{ row.correct + row.wrong }}</td><td>{{ row.correct + row.wrong ? `${Math.round(row.correct / (row.correct + row.wrong) * 100)}%` : '—' }}</td><td>{{ row.failed }}</td><td>{{ row.pending }}</td><td>{{ row.count ? seconds(row.latency / row.count) : '—' }}</td><td>{{ row.probe }}</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>账号</th><th>答对 / 已评分</th><th>正确率</th><th>调用失败</th><th>未确认</th><th>平均耗时</th><th>最近探针</th></tr></thead><tbody><tr v-for="row in comparison" :key="row.id"><td>{{ row.name }}</td><td>{{ row.correct }} / {{ row.correct + row.wrong }}</td><td>{{ row.correct + row.wrong ? `${Math.round(row.correct / (row.correct + row.wrong) * 100)}%` : '—' }}</td><td>{{ row.failed }}</td><td>{{ row.pending }}</td><td>{{ row.count ? seconds(row.latency / row.count) : '—' }}</td><td><template v-if="row.probe"><span class="badge" :class="resultView(row.probe).className">{{ resultView(row.probe).label }}</span><small v-if="resultView(row.probe).attempts">{{ resultView(row.probe).attempts }}</small></template><template v-else>—</template></td></tr></tbody></table></div>
       </section>
       <section class="panel">
         <div class="section-head"><strong>{{ tab === 'history' ? '测试记录' : '本批次结果' }}</strong><div class="inline"><button :disabled="!displayedRecords.length" @click="download('json')">导出JSON</button><button :disabled="!displayedRecords.length" @click="download('csv')">导出CSV</button></div></div>
         <p v-if="tab === 'history'" class="muted">最多保留100项，按60KiB消息帧预算自动移出最早非在途记录{{ evicted ? `，累计移出 ${evicted} 项，请及时导出` : '' }}</p>
-        <div v-if="displayedRecords.length" class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>题目 / 探针</th><th>模型</th><th>结果</th><th>耗时</th><th>操作</th></tr></thead><tbody><tr v-for="r in displayedRecords" :key="r.id"><td class="nowrap">{{ time(r.started_at_ms) }}</td><td>{{ accountName(r.account_id, r.account_name) }}</td><td>{{ r.question_title || '门票探针' }}</td><td>{{ r.model }}<small v-if="r.mode === 'question'">{{ r.effort }}</small></td><td><span class="badge" :class="r.status">{{ label(r.status) }}</span></td><td class="nowrap">{{ seconds(r.latency_ms) }}</td><td><button class="text-button" @click="current = r">详情</button></td></tr></tbody></table></div>
+        <div v-if="displayedRecords.length" class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>题目 / 探针</th><th>模型</th><th>结果</th><th>耗时</th><th>操作</th></tr></thead><tbody><tr v-for="r in displayedRecords" :key="r.id"><td class="nowrap">{{ time(r.started_at_ms) }}</td><td>{{ accountName(r.account_id, r.account_name) }}</td><td>{{ r.question_title || '门票探针' }}</td><td>{{ r.model }}<small v-if="r.mode === 'question'">{{ r.effort }}</small></td><td><span class="badge" :class="resultView(r).className">{{ resultView(r).label }}</span><small v-if="resultView(r).attempts">{{ resultView(r).attempts }}</small></td><td class="nowrap">{{ seconds(r.latency_ms) }}</td><td><button class="text-button" @click="current = r">详情</button></td></tr></tbody></table></div>
         <p v-else class="empty">{{ loading ? '正在加载' : '暂无测试结果' }}</p>
       </section>
     </template>
-    <div v-if="current" class="overlay" @click.self="current = null"><section ref="dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title" @keydown="trapFocus" @keydown.esc="current = null"><div class="section-head"><strong id="detail-title">测试详情</strong><button @click="current = null">关闭</button></div><p><span class="badge" :class="current.status">{{ label(current.status) }}</span> {{ current.detail }}</p><p class="muted">操作ID {{ current.id }}</p><template v-if="current.prompt"><h4>测试题目</h4><pre>{{ current.prompt }}</pre><h4>模型回答</h4><pre>{{ current.answer || '暂无完整回答' }}</pre><p>标准答案 {{ current.expected }}</p></template><ProbeDetails v-if="current.mode === 'probe'" :metrics="current.metrics" /><details><summary>原始执行指标</summary><pre>{{ JSON.stringify(current.metrics, null, 2) }}</pre></details></section></div>
+    <div v-if="current" class="overlay" @click.self="current = null"><section ref="dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title" @keydown="trapFocus" @keydown.esc="current = null"><div class="section-head"><strong id="detail-title">测试详情</strong><button @click="current = null">关闭</button></div><p><span class="badge" :class="resultView(current).className">{{ resultView(current).label }}</span> {{ current.detail }}</p><p class="muted">操作ID {{ current.id }}</p><template v-if="current.prompt"><h4>测试题目</h4><pre>{{ current.prompt }}</pre><h4>模型回答</h4><pre>{{ current.answer || '暂无完整回答' }}</pre><p>标准答案 {{ current.expected }}</p></template><ProbeDetails v-if="current.mode === 'probe'" :metrics="current.metrics" /><details><summary>原始执行指标</summary><pre>{{ JSON.stringify(current.metrics, null, 2) }}</pre></details></section></div>
   </main>
 </template>

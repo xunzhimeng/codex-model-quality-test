@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { request, type Account, type Key } from './api'
+import { request, type Account, type Key, type TestRecord } from './api'
+import { resultView } from './result'
 import { useModels } from './models'
 interface Settings { scheduled: boolean; auto_disable: boolean; interval_minutes: number; model: string; client_key_id: string | null; account_ids: string[]; daily_max: number; quiet_hours: { start: string; end: string } | null; degradation_policy: 'confirm' | 'immediate'; confirmation_delay_seconds: number }
-interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string; paused: boolean; total_runs: number; daily_runs: number; confirm_due_ms: number | null }
+interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string; paused: boolean; total_runs: number; daily_runs: number; confirm_due_ms: number | null; last_result?: TestRecord | null }
 interface State { generation: string; settings: Settings; accounts: Record<string, Status>; last_tick_ms: number | null; last_error: string | null; paused: boolean; control_revision: number }
 interface Task { id: string; name: string; state: State; availability: Record<string, { status: string; next_allowed_ms: number | null }>; total_runs: number; daily_runs: number }
 interface Snapshot { tasks: Task[]; defaults: Settings; total_runs: number; daily_runs: number; timezone: string; now_ms: number; control_revision: number }
@@ -21,7 +22,7 @@ const staleEditor = computed(() => editingId.value !== null && (!editedTask.valu
 function copySettings(value: Settings): Settings { return { ...value, account_ids: [...value.account_ids], quiet_hours: value.quiet_hours ? { ...value.quiet_hours } : null } }
 function time(value: number | null | undefined) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false, timeZone: snapshot.value?.timezone || 'Asia/Shanghai' }) : '—' }
 function name(id: string) { return props.accounts.find(a => a.id === id)?.name || id }
-function statusLabel(status: string) { return ({ running: '执行中或结果未确认', skipped: '未执行', interrupted: '执行中断', healthy: '未发现降级', degraded: '疑似降级', inconclusive: '无法判断' } as Record<string, string>)[status] || '尚未执行' }
+function accountResult(status?: Status) { return resultView(status?.last_result || { status: status?.last_status || '' }) }
 function actionLabel(action: string) { return ({ pending: '停用待确认', disabled: '已自动停用', unconfirmed: '停用未确认' } as Record<string, string>)[action] || '无停用动作' }
 function taskStatus(task: Task) { return !task.state.settings.scheduled ? '未启用' : task.state.paused ? '已暂停' : '运行中' }
 function failure(e: unknown) {
@@ -170,7 +171,7 @@ onMounted(load)
             <tr v-for="id in task.state.settings.account_ids" :key="id">
               <td>{{ name(id) }}</td><td>{{ task.availability[id]?.status || '尚未执行' }}</td>
               <td>{{ task.state.accounts[id]?.total_runs || 0 }} / {{ task.state.accounts[id]?.daily_runs || 0 }}<small>本任务今日上限 {{ task.state.settings.daily_max }}</small></td>
-              <td>{{ time(task.state.accounts[id]?.last_checked_ms) }}</td><td>{{ statusLabel(task.state.accounts[id]?.last_status || '') }}</td>
+              <td>{{ time(task.state.accounts[id]?.last_checked_ms) }}</td><td><span class="badge" :class="accountResult(task.state.accounts[id]).className">{{ accountResult(task.state.accounts[id]).label }}</span><small v-if="accountResult(task.state.accounts[id]).attempts">{{ accountResult(task.state.accounts[id]).attempts }}</small></td>
               <td>{{ task.state.accounts[id]?.streak || 0 }} / {{ task.state.settings.degradation_policy === 'immediate' ? 1 : 2 }}</td>
               <td>{{ time(task.availability[id]?.next_allowed_ms) }}</td><td>{{ actionLabel(task.state.accounts[id]?.action || '') }}<small>{{ task.state.accounts[id]?.action_detail }}</small></td>
               <td><button :disabled="busy || !task.state.settings.scheduled" :aria-label="(task.state.accounts[id]?.paused ? '继续监控 ' : '暂停监控 ') + task.name + ' / ' + name(id)" @click="control(!task.state.accounts[id]?.paused, task, id)">{{ task.state.accounts[id]?.paused ? '继续' : '暂停' }}</button></td>
@@ -185,9 +186,10 @@ onMounted(load)
       <p>关闭页面后，宿主维护任务仍继续执行，停用插件后停止，每次维护最多测试一个到期账号，繁忙时顺延</p>
       <p>预约确认由后续维护回调执行，等待不少于配置秒数，不保证精确到秒，确认等待期间不启动同账号的常规探针，确认到期后超过一个常规间隔或跨过不测试时段则作废，不以陈旧结果停用</p>
       <p>暂停或保存会清空确认链，不撤回已发出的请求，继续后按常规间隔执行，关闭任务同时关闭自动停用，重新启用后需编辑任务开启自动停用</p>
-      <p>执行次数按后台准入次数统计，已准入但失败或取消仍计次，保存、暂停及进程重启不清空次数，每日上限包含确认复测，达到上限后次日恢复，不测试时段不补发堆积任务</p>
-      <p>手动探针和题目测试不参与监控判定，超时、限流、认证失败或无法判断不触发自动停用，自动停用作用于宿主账号，也会影响其他任务</p>
-      <p>定时探针最多等待18秒，手动探针最多90秒，停用动作未确认时不自动重发，需在账号管理核对，账号不会自动恢复</p>
+      <p>执行次数按后台准入次数统计，内部重试不另计次，已准入但失败或取消仍计次，保存、暂停及进程重启不清空次数，每日上限包含确认复测，达到上限后次日恢复，不测试时段不补发堆积任务</p>
+      <p>手动探针和题目测试不参与监控判定，超时、限流、认证失败或未取得判定不触发自动停用，自动停用作用于宿主账号，也会影响其他任务</p>
+      <p>探针仅对可重试故障自动重试，含初次最多3次；后台总计最多18秒、每次最多6秒，手动总计最多90秒、每次最多30秒；取消会停止内部执行，不撤回已发出的请求</p>
+      <p>停用动作未确认时不自动重发，需在账号管理核对，账号不会自动恢复</p>
       <p>探针按Key限定账号与模型范围，强制走账号代理，失败不直连，不计入Key账单，不自动刷新令牌，敏感导出仅限所选单账号和本次调用内存，敏感内容不返回页面、不写状态或日志</p>
     </div></details>
   </section>
