@@ -29,6 +29,7 @@ fn registration() -> ManagementRegistration {
             ("GET", "catalog"),
             ("POST", "models"),
             ("GET", "history"),
+            ("POST", "history/delete"),
             ("POST", "questions"),
             ("POST", "run"),
             ("GET", "monitor"),

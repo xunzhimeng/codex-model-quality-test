@@ -30,12 +30,14 @@ pub struct Connection {
     pub client: Client,
     pub token: String,
     pub upstream_id: String,
+    pub transport: &'static str,
 }
 
 pub async fn connection(
     host: &HostClient,
     id: &str,
     upstream_id: &str,
+    proxy_required: bool,
 ) -> Result<Connection, String> {
     // 导出合同以逗号分割ID；只接受内置账号的安全标识，禁止编码后变成多账号选择。
     if id.is_empty()
@@ -66,10 +68,11 @@ pub async fn connection(
     if material.id != id || material.account_id.as_deref() != Some(upstream_id) {
         return Err("账号导出ID不匹配，未发送探针".into());
     }
-    let proxy = material
-        .outbound_proxy_url
-        .filter(|s| !s.trim().is_empty())
-        .ok_or("账号未配置代理，禁止直连探针")?;
+    let proxy = material.outbound_proxy_url.filter(|s| !s.trim().is_empty());
+    // 脱敏目录声明了代理而敏感导出缺失时停止，不能把配置缺口解释成允许直连。
+    if proxy_required && proxy.is_none() {
+        return Err("账号代理配置已变化或导出缺少代理，请刷新后重试".into());
+    }
     let token = material
         .access_token
         .filter(|s| !s.is_empty())
@@ -79,35 +82,41 @@ pub async fn connection(
         .filter(|s| !s.is_empty())
         .ok_or("账号导出缺少上游标识")?;
     Ok(Connection {
-        client: client(&proxy)?,
+        client: client(proxy.as_deref())?,
         token,
         upstream_id,
+        transport: if proxy.is_some() {
+            "account_proxy"
+        } else {
+            "direct"
+        },
     })
 }
 
-fn client(proxy: &str) -> Result<Client, String> {
-    let url = reqwest::Url::parse(proxy).map_err(|_| "账号代理格式无效")?;
-    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
-        || url.host_str().is_none()
-        || url.port_or_known_default().is_none()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !matches!(url.path(), "" | "/")
-    {
-        return Err("账号代理格式无效".into());
+fn client(proxy: Option<&str>) -> Result<Client, String> {
+    // 禁用环境代理；有账号代理时只走该代理，无配置时才使用服务器出口。
+    let mut builder = Client::builder().no_proxy();
+    if let Some(proxy) = proxy {
+        let url = reqwest::Url::parse(proxy).map_err(|_| "账号代理格式无效")?;
+        if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+            || url.host_str().is_none()
+            || url.port_or_known_default().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+        {
+            return Err("账号代理格式无效".into());
+        }
+        builder = builder.proxy(Proxy::all(proxy).map_err(|_| "账号代理配置无效")?);
     }
-    let proxy = Proxy::all(proxy).map_err(|_| "账号代理配置无效")?;
-    // 显式禁止环境代理、重定向和连接池跨轮复用；代理失败没有直连路径。
-    Client::builder()
-        .no_proxy()
-        .proxy(proxy)
+    builder
         .redirect(Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(85))
         .pool_max_idle_per_host(0)
         .build()
-        .map_err(|_| "探针代理客户端初始化失败".into())
+        .map_err(|_| "探针网络客户端初始化失败".into())
 }
 
 #[cfg(test)]
@@ -150,7 +159,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
                 .unwrap();
         });
-        let client = client(&format!("http://user:password@{address}")).unwrap();
+        let client = client(Some(&format!("http://user:password@{address}"))).unwrap();
         assert_eq!(
             client
                 .get(&target_url)
@@ -210,7 +219,7 @@ mod tests {
             assert_eq!(u16::from_be_bytes(target_port), port);
             s.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
         });
-        let client = client(&format!("socks5h://user:password@{address}")).unwrap();
+        let client = client(Some(&format!("socks5h://user:password@{address}"))).unwrap();
         assert!(
             client
                 .get(format!("http://localhost:{port}/"))
@@ -221,10 +230,43 @@ mod tests {
         worker.join().unwrap();
         assert!(target.accept().is_err());
     }
+    #[tokio::test]
+    async fn unconfigured_account_client_connects_directly() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = target.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = target.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = [0; 4096];
+            let n = stream.read(&mut bytes).unwrap();
+            let headers = String::from_utf8_lossy(&bytes[..n]);
+            assert!(headers.starts_with("GET /direct HTTP/1.1"));
+            assert!(!headers.to_lowercase().contains("proxy-authorization"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .unwrap();
+        });
+        assert_eq!(
+            client(None)
+                .unwrap()
+                .get(format!("http://{address}/direct"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "OK"
+        );
+        worker.join().unwrap();
+    }
     #[test]
-    fn rejects_invalid_or_direct_proxy() {
-        assert!(client("").is_err());
-        assert!(client("file:///tmp/proxy").is_err());
-        assert!(client("http://localhost:1/?secret=1").is_err());
+    fn rejects_invalid_configured_proxy_without_using_direct_mode() {
+        assert!(client(Some("")).is_err());
+        assert!(client(Some("file:///tmp/proxy")).is_err());
+        assert!(client(Some("http://localhost:1/?secret=1")).is_err());
+        assert!(client(None).is_ok());
     }
 }

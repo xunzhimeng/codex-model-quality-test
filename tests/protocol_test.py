@@ -68,6 +68,7 @@ class Host:
         self.model_names=['fixture-model']
         self.proxy_configured=True
         self.export_id='fixture-account'
+        self.export_token='fixture-token-not-real'
         self.export_count=0
         self.model_policy={'mode':'all','models':[]}
         self.client_profile={'originator':'Codex Desktop','codexVersion':'0.153.4','userAgent':'Codex Desktop/0.153.4 (Mac OS 15.7.1; arm64) unknown (Codex Desktop; 26.901.51231)'}
@@ -231,7 +232,7 @@ class Host:
                 assert parse_qs(uri.query)=={'accountIds':['fixture-account'],'confirm':['export_sensitive_accounts']}
                 assert params['method']=='GET' and not body
                 self.export_count+=1
-                data={'documents':[{'provider':'openai','document':{'accounts':[{'id':self.export_id,'accessToken':'fixture-token-not-real','accountId':'fixture-upstream','outboundProxyUrl':self.proxy_url}]}}]}
+                data={'documents':[{'provider':'openai','document':{'accounts':[{'id':self.export_id,'accessToken':self.export_token,'accountId':'fixture-upstream','outboundProxyUrl':self.proxy_url}]}}]}
             elif uri.path=='/api/admin/accounts/batch-update':
                 assert params['method']=='POST'
                 assert json.loads(body)=={'accountIds':['fixture-account'],'enabled':False}
@@ -358,6 +359,72 @@ class Integration(unittest.TestCase):
         self.host.defer_resumes=False
         status,result=self.run_request('fixture-v7-after-cancel-resume')
         self.assertEqual(status,200,result);self.assertEqual(result['record']['status'],'correct')
+    def delete_history(self,account_id='fixture-account',snapshot=None):
+        if snapshot is None:snapshot=self.host.call('GET','history')[1]
+        return self.host.call('POST','history/delete',{'account_id':account_id,'expected_version':snapshot['version']})
+    def test_delete_account_history_preserves_other_records_bank_monitor_and_counters(self):
+        import copy
+        self.configure_monitor(auto_disable=False);self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.run_request('fixture-delete-question')
+        other=copy.deepcopy(self.host.states['history']['value']['records'][-1]);other.update(id='fixture-other-record',account_id='removed-host-account',account_name='已移除账号')
+        self.host.states['history']['value']['records'].append(other)
+        self.host.states['history']['value']['evicted']=12
+        self.host.call('POST','questions',{'questions':[{'id':'custom_keep','title':'保留题目','category':'数学','prompt':'1+1','answer':'2'}],'expected_version':None})
+        before=copy.deepcopy(self.host.states);snapshot=self.host.call('GET','history')[1]
+        status,result=self.delete_history(snapshot=snapshot)
+        self.assertEqual(status,200,result);self.assertEqual(result['deleted'],2)
+        self.assertEqual(result['history']['records'],[other]);self.assertEqual(result['history']['evicted'],12)
+        self.assertGreater(result['history']['version'],snapshot['version'])
+        self.assertEqual(self.host.states['monitor'],before['monitor']);self.assertEqual(self.host.states['bank'],before['bank'])
+        self.assertTrue(self.host.account_enabled);self.assertEqual(self.host.disable_count,0)
+        self.assertNotIn('last_result',self.monitor_snapshot()['state']['accounts']['fixture-account'])
+        # 宿主目录已经没有的账号仍可按历史内部ID清除。
+        status,result=self.delete_history('removed-host-account')
+        self.assertEqual(status,200,result);self.assertEqual(result['deleted'],1);self.assertEqual(result['history']['records'],[])
+    def test_delete_history_rejects_stale_snapshot_and_keeps_new_results(self):
+        self.run_request('fixture-delete-cas-old');snapshot=self.host.call('GET','history')[1]
+        self.run_request('fixture-delete-cas-new')
+        status,result=self.delete_history(snapshot=snapshot)
+        self.assertEqual(status,409,result);self.assertEqual(len(self.host.states['history']['value']['records']),2)
+        self.assertEqual(self.delete_history()[1]['deleted'],2)
+    def test_delete_history_blocks_only_actual_inflight_test(self):
+        self.run_request('fixture-delete-before-active')
+        attempts=[]
+        self.host.on_model=lambda msg:attempts.append(self.delete_history())
+        self.assertEqual(self.run_request('fixture-delete-active')[0],200)
+        self.assertEqual(attempts[0][0],400);self.assertIn('正在执行',attempts[0][1]['error'])
+        self.host.on_model=None
+        self.assertEqual(self.delete_history()[1]['deleted'],2)
+    def test_delete_old_cancelled_unconfirmed_record_does_not_require_permanent_wait(self):
+        call_id=self.host.next_id
+        self.host.on_model=lambda msg:self.host.write({'type':'cancel','id':call_id})
+        self.assertEqual(self.run_request('fixture-delete-cancelled')[0],'cancelled')
+        self.host.on_model=None
+        self.assertEqual(self.host.states['history']['value']['records'][0]['status'],'running')
+        status,result=self.delete_history()
+        self.assertEqual(status,200,result);self.assertEqual(result['deleted'],1)
+        self.assertEqual(self.run_request('fixture-after-clearing-history')[0],200)
+    def test_delete_history_uses_state_cas_and_releases_lock_after_write_failure(self):
+        self.run_request('fixture-delete-write-failure')
+        original=self.host.callback
+        def reject_write(msg,body):
+            if msg['method']=='host.state.put':
+                self.host.write({'type':'error','id':msg['id'],'error':{'code':'conflict','message':'fixture conflict','send_state':'not_sent'}})
+                return
+            original(msg,body)
+        self.host.callback=reject_write
+        status,result=self.delete_history()
+        self.assertEqual(status,400,result);self.assertEqual(len(self.host.states['history']['value']['records']),1)
+        self.host.callback=original
+        self.assertEqual(self.delete_history()[1]['deleted'],1)
+        self.assertEqual(self.run_request('fixture-after-clearing-failure')[0],200)
+    def test_delete_empty_history_and_invalid_account_do_not_write(self):
+        status,result=self.delete_history()
+        self.assertEqual(status,200,result);self.assertEqual(result['deleted'],0);self.assertIsNone(result['history']['version'])
+        self.assertNotIn('history',self.host.states)
+        for account in ['', 'x'*129, 'bad\naccount']:
+            self.assertEqual(self.delete_history(account)[0],400)
+        self.assertEqual(self.host.model_count,0)
     def test_question_error_displays_host_status_without_plugin_retry_or_secret(self):
         self.host.model_fault='upstream';self.host.model_http_status=429
         record=self.run_request('fixture-question-status')[1]['record']
@@ -903,12 +970,36 @@ class Integration(unittest.TestCase):
                 setattr(self.host,field,original)
         self.host.key_groups=['fixture-group'];self.host.group_enabled=False
         status,_=self.run_request('fixture-disabled-group','probe');self.assertEqual(status,400);self.assertEqual(self.host.export_count,0)
-    def test_missing_proxy_and_export_mismatch_stop_before_network(self):
-        self.host.proxy_configured=False
-        status,_=self.run_request('fixture-no-proxy','probe');self.assertEqual(status,400);self.assertEqual(self.host.export_count,0)
+    def test_configured_proxy_missing_from_export_stops_before_network(self):
         self.host.proxy_configured=True;self.host.proxy_url=None
         result=self.run_request('fixture-empty-export-proxy','probe')[1]['record']
-        self.assertEqual(result['status'],'inconclusive');self.assertIn('禁止直连',result['detail']);self.assertEqual(self.host.proxy.connects,0)
+        self.assertEqual(result['status'],'inconclusive');self.assertIn('导出缺少代理',result['detail']);self.assertEqual(self.host.proxy.connects,0)
+        self.assertNotIn('transport',result['metrics'])
+    def test_no_proxy_account_is_allowed_for_monitor_configuration(self):
+        self.host.proxy_configured=False;self.host.proxy_url=None
+        task=self.configure_monitor(auto_disable=False)
+        self.assertEqual(task['state']['settings']['account_ids'],['fixture-account'])
+        self.assertEqual(self.host.export_count,0)
+        self.assertFalse(self.host.call('GET','catalog')[1]['accounts'][0]['proxy_configured'])
+    def test_no_proxy_manual_probe_reaches_direct_preparation_not_proxy_rejection(self):
+        self.host.proxy_configured=False;self.host.proxy_url=None
+        # 本地故意提供无效头，验证真实进程选择无代理路径后安全停止，绝不访问真实上游。
+        self.host.export_token='invalid\ntoken'
+        status,result=self.run_request('fixture-direct-preparation','probe')
+        self.assertEqual(status,200,result);self.assertEqual(self.host.export_count,1)
+        self.assertIn('访问令牌无法用于请求头',result['record']['detail'])
+        self.assertEqual(self.host.proxy.connects,0)
+        self.assertNotIn('invalid',dump(result['record']).decode())
+    def test_no_proxy_scheduled_probe_reaches_preparation_and_counts_once(self):
+        self.host.proxy_configured=False;self.host.proxy_url=None
+        self.host.export_token='invalid\ntoken'
+        self.configure_monitor(auto_disable=False);self.due()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(record['metrics']['source'],'scheduled')
+        self.assertIn('访问令牌无法用于请求头',record['detail'])
+        self.assertEqual(self.monitor_snapshot()['total_runs'],1)
+        self.assertEqual(self.host.export_count,1);self.assertEqual(self.host.proxy.connects,0)
     def test_export_only_selected_id_and_rejects_mismatch(self):
         self.host.export_id='other-account'
         r=self.run_request('fixture-export-mismatch','probe')[1]['record']

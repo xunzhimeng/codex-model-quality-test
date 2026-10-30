@@ -100,16 +100,20 @@ pub async fn run(
     account: &AuthRuntimeAccount,
     model: &str,
     timeout: Duration,
+    proxy_required: bool,
 ) -> ProbeResult {
     let start = Instant::now();
     let attempt_budget = timeout / MAX_ATTEMPTS;
     let mut rounds = Vec::new();
     let mut attempts = Vec::new();
     let mut stop = None;
+    let mut transport = None;
     // 一次测试冻结身份与代理，重试从新的首轮开始，绝不复用失败尝试的门票。
-    let prepared = tokio::time::timeout(attempt_budget, prepare(host, account)).await;
+    let prepared =
+        tokio::time::timeout(attempt_budget, prepare(host, account, proxy_required)).await;
     let mut final_result = match prepared {
         Ok(Ok((connection, headers))) => {
+            transport = Some(connection.transport);
             let mut result = Err(Failure::new("timeout", "探针超时", true));
             for number in 1..=MAX_ATTEMPTS {
                 let remaining = timeout.saturating_sub(start.elapsed());
@@ -177,7 +181,9 @@ pub async fn run(
             json!({"failure":error}),
         ),
     };
-    metrics["transport"] = json!("account_proxy");
+    if let Some(transport) = transport {
+        metrics["transport"] = json!(transport);
+    }
     metrics["key_billed"] = json!(false);
     metrics["rounds"] = json!(rounds);
     metrics["attempt_count"] = json!(attempts.len());
@@ -223,6 +229,7 @@ fn retry_wait(
 async fn prepare(
     host: &HostClient,
     account: &AuthRuntimeAccount,
+    proxy_required: bool,
 ) -> Result<(proxy_transport::Connection, HeaderMap), Failure> {
     eligibility(account)?;
     let profile = host
@@ -237,6 +244,7 @@ async fn prepare(
             .upstream_account_id
             .as_deref()
             .ok_or("账号缺少上游标识")?,
+        proxy_required,
     )
     .await?;
     let mut authorization = HeaderValue::from_str(&format!("Bearer {}", connection.token))
@@ -369,9 +377,9 @@ async fn shot(
         .await
         .map_err(|error| {
             if error.is_timeout() {
-                Failure::new("timeout", "账号代理请求超时", true)
+                Failure::new("timeout", "探针请求超时", true)
             } else {
-                Failure::new("connection_error", "账号代理连接失败，禁止回退直连", true)
+                Failure::new("connection_error", "探针连接失败", true)
             }
         })?;
     round.http_status = Some(response.status().as_u16());
@@ -444,7 +452,7 @@ async fn read_shot(response: &mut reqwest::Response, round: &mut Round) -> Resul
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| Failure::new("read_error", "代理响应流读取中断", true))?
+        .map_err(|_| Failure::new("read_error", "响应流读取中断", true))?
     {
         if body.len() + chunk.len() > MAX_BODY {
             return Err(Failure::new("invalid_response", "探针响应超过上限", false));

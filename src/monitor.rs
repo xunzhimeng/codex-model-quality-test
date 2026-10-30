@@ -482,9 +482,6 @@ impl Monitor {
                     &info,
                 )
                 .await?;
-                if info.proxy_endpoint.as_ref().is_none_or(|s| s.is_empty()) {
-                    return Err("监控账号未配置代理".into());
-                }
                 if account.provider_id != "openai" || account.authentication_kind != "oauth" {
                     return Err("监控仅支持OpenAI OAuth账号".into());
                 }

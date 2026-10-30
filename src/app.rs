@@ -133,6 +133,12 @@ struct BankRequest {
     questions: Vec<Question>,
     expected_version: Option<u64>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteHistoryRequest {
+    account_id: String,
+    expected_version: Option<u64>,
+}
 
 pub fn json_response(status: u16, value: &impl Serialize) -> Result<Response, String> {
     Ok(TypedReply::new(ManagementResponse {
@@ -150,6 +156,16 @@ fn decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, String> {
 }
 
 impl App {
+    fn lock_account(&self, id: &str) -> Result<AccountGuard, String> {
+        let mut accounts = self.accounts.lock().map_err(|_| "账号测试锁不可用")?;
+        if !accounts.insert(id.to_owned()) {
+            return Err("该账号正在执行测试，请等待当前测试结束".into());
+        }
+        Ok(AccountGuard {
+            accounts: self.accounts.clone(),
+            id: id.to_owned(),
+        })
+    }
     pub(crate) fn account_busy(&self, id: &str) -> bool {
         self.accounts
             .lock()
@@ -230,8 +246,44 @@ impl App {
                 json_response(200, &models)
             }
             ("GET", "history") => {
-                let (history, _) = store::get::<History>(host, "history").await?;
-                json_response(200, &history)
+                let (history, version) = store::get::<History>(host, "history").await?;
+                json_response(
+                    200,
+                    &json!({"records":history.records,"evicted":history.evicted,"version":version}),
+                )
+            }
+            ("POST", "history/delete") => {
+                let request: DeleteHistoryRequest = decode(&call.payload)?;
+                if request.account_id.is_empty()
+                    || request.account_id.len() > 128
+                    || request.account_id.chars().any(char::is_control)
+                {
+                    return Err("账号标识无效".into());
+                }
+                // 与测试使用同一账号锁，并先锁账号再锁历史；删除不影响其他账号执行。
+                let _account = self.lock_account(&request.account_id)?;
+                let _guard = self.history.lock().await;
+                let (mut history, version) = store::get::<History>(host, "history").await?;
+                if version != request.expected_version {
+                    return json_response(
+                        409,
+                        &json!({"error":"测试记录已变化，请刷新并重新确认清除"}),
+                    );
+                }
+                let previous = history.records.len();
+                history
+                    .records
+                    .retain(|r| r.account_id != request.account_id);
+                let deleted = previous - history.records.len();
+                if deleted > 0 {
+                    // 无当前执行的旧running只作未确认审计，不永久阻止用户清除历史。
+                    store::put(host, "history", &history, version).await?;
+                }
+                let (history, version) = store::get::<History>(host, "history").await?;
+                json_response(
+                    200,
+                    &json!({"deleted":deleted,"history":{"records":history.records,"evicted":history.evicted,"version":version}}),
+                )
             }
             ("POST", "questions") => {
                 let request: BankRequest = decode(&call.payload)?;
@@ -287,16 +339,7 @@ impl App {
             Ok(slot) => slot,
             Err(_) => return Err("最多同时运行4个测试".into()),
         };
-        {
-            let mut accounts = self.accounts.lock().map_err(|_| "账号测试锁不可用")?;
-            if !accounts.insert(request.account_id.clone()) {
-                return Err("该账号正在执行测试，请等待当前测试结束".into());
-            }
-        }
-        let _account = AccountGuard {
-            accounts: self.accounts.clone(),
-            id: request.account_id.clone(),
-        };
+        let _account = self.lock_account(&request.account_id)?;
         // 去重凭证先落盘再调用上游，响应丢失也不以同一ID重复消耗。
         {
             let _guard = self.history.lock().await;
@@ -337,13 +380,6 @@ impl App {
                 &identity,
             )
             .await?;
-            if identity
-                .proxy_endpoint
-                .as_ref()
-                .is_none_or(|s| s.is_empty())
-            {
-                return Err("账号未配置代理，禁止直连探针".into());
-            }
         }
         let started = now_ms();
         let record = Record {
@@ -396,6 +432,10 @@ impl App {
                 &account,
                 &request.model,
                 Duration::from_secs(timeout_seconds),
+                identity
+                    .proxy_endpoint
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty()),
             )
             .await;
             Ok((r.status, None, r.detail, r.metrics))

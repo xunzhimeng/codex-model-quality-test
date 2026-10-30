@@ -1,20 +1,25 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { request, type Account, type Catalog, type History, type Question, type TestRecord } from './api'
+import { request, type Account, type Catalog, type History, type HistoryDeleteResult, type Question, type TestRecord } from './api'
 import { csvCell, runAccountQueue } from './queue'
 import { useModels } from './models'
 import { resultView } from './result'
 import MonitorPanel from './MonitorPanel.vue'
 import ProbeDetails from './ProbeDetails.vue'
 const catalog = ref<Catalog>({ accounts: [], keys: [], questions: [], bank_version: null, version: '' })
-const records = ref<TestRecord[]>([]), evicted = ref(0), error = ref(''), notice = ref(''), loading = ref(false)
+const records = ref<TestRecord[]>([]), evicted = ref(0), historyVersion = ref<number | null>(null), error = ref(''), notice = ref(''), loading = ref(false)
 const tab = ref('new'), mode = ref('question'), accountFilter = ref(''), selectedAccounts = ref<string[]>([]), selectedQuestions = ref<string[]>([])
 const key = ref(''), model = ref(''), effort = ref('medium'), concurrency = ref(2)
 const { models, modelsLoading, modelsError, loadModels } = useModels(() => key.value, model)
 const running = ref(false), stopping = ref(false), completed = ref(0), total = ref(0), batchId = ref(''), current = ref<TestRecord | null>(null)
 const customJson = ref(''), bankSaving = ref(false)
 const dialog = ref<HTMLElement | null>(null)
+const historyDeleteDialog = ref<HTMLElement | null>(null)
+const historyDeleteOpen = ref(false), historyDeleteError = ref(''), historyDeleteStale = ref(false)
+const historyDeleteAccountId = ref(''), historyDeleteTargetId = ref(''), historyDeleteName = ref('')
+const historyDeleteExpectedVersion = ref<number | null>(null), historyDeleteCount = ref(0)
 let previousFocus: HTMLElement | null = null
+let historyDeletePreviousFocus: HTMLElement | null = null
 watch(current, async (value) => {
   if (value) { previousFocus = document.activeElement as HTMLElement; await nextTick(); dialog.value?.querySelector<HTMLButtonElement>('button')?.focus() }
   else previousFocus?.focus()
@@ -26,8 +31,24 @@ function trapFocus(event: KeyboardEvent) {
   if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
 }
+function trapHistoryDeleteFocus(event: KeyboardEvent) {
+  if (event.key !== 'Tab' || !historyDeleteDialog.value) return
+  const nodes = [...historyDeleteDialog.value.querySelectorAll<HTMLElement>('button, [href], input, textarea, select, [tabindex="0"]')]
+  const first = nodes[0], last = nodes[nodes.length - 1]
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+}
 const visibleAccounts = computed(() => catalog.value.accounts.filter(a => !accountFilter.value || `${a.name} ${a.email || ''} ${a.id} ${a.provider}`.toLowerCase().includes(accountFilter.value.toLowerCase())))
 const displayedRecords = computed(() => tab.value === 'new' ? records.value.filter(r => r.batch_id === batchId.value) : records.value)
+const historyAccountOptions = computed(() => {
+  const options = new Map<string, { id: string; name: string; count: number }>()
+  for (const record of records.value) {
+    const existing = options.get(record.account_id)
+    if (existing) existing.count++
+    else options.set(record.account_id, { id: record.account_id, name: accountName(record.account_id, record.account_name), count: 1 })
+  }
+  return [...options.values()]
+})
 const selectedQuestion = computed(() => catalog.value.questions.find(q => q.id === selectedQuestions.value[0]))
 const comparison = computed(() => {
   const map = new Map<string, { id: string; name: string; correct: number; wrong: number; failed: number; pending: number; latency: number; count: number; probe: TestRecord | null }>()
@@ -44,7 +65,58 @@ function accountName(id: string, historical: string) { return catalog.value.acco
 function seconds(ms: number | null) { return ms === null ? '—' : `${(ms / 1000).toFixed(2)} s` }
 function time(ms: number) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }) }
 function upsert(record: TestRecord) { const i = records.value.findIndex(r => r.id === record.id); if (i === -1) records.value.unshift(record); else records.value[i] = record }
-async function refreshHistory() { const history = await request<History>('history'); records.value = [...history.records].reverse(); evicted.value = history.evicted }
+async function refreshHistory() {
+  const history = await request<History>('history')
+  records.value = [...history.records].reverse()
+  evicted.value = history.evicted
+  historyVersion.value = history.version ?? null
+}
+function openHistoryDelete(event: Event) {
+  if (loading.value || running.value) return
+  const account = historyAccountOptions.value.find(option => option.id === historyDeleteAccountId.value)
+  if (!account) return
+  historyDeletePreviousFocus = event.currentTarget as HTMLElement
+  historyDeleteTargetId.value = account.id
+  historyDeleteName.value = account.name
+  historyDeleteExpectedVersion.value = historyVersion.value
+  historyDeleteCount.value = account.count
+  historyDeleteError.value = ''; historyDeleteStale.value = false; historyDeleteOpen.value = true
+  void nextTick(() => historyDeleteDialog.value?.querySelector<HTMLButtonElement>('button')?.focus())
+}
+function closeHistoryDelete(force = false) {
+  if (!force && historyDeleteOpen.value && (loading.value || running.value)) return
+  historyDeleteOpen.value = false
+  historyDeleteError.value = ''
+  void nextTick(() => {
+    if (historyDeletePreviousFocus?.isConnected && !historyDeletePreviousFocus.matches(':disabled')) historyDeletePreviousFocus.focus()
+    historyDeletePreviousFocus = null
+  })
+}
+async function deleteHistory() {
+  if (loading.value || running.value || historyDeleteStale.value || !historyDeleteTargetId.value) return
+  historyDeleteError.value = ''; loading.value = true
+  const deletedAccountId = historyDeleteTargetId.value
+  try {
+    const result = await request<HistoryDeleteResult>('history/delete', {
+      account_id: deletedAccountId,
+      expected_version: historyDeleteExpectedVersion.value,
+    })
+    records.value = [...result.history.records].reverse()
+    evicted.value = result.history.evicted
+    historyVersion.value = result.history.version ?? null
+    if (current.value?.account_id === deletedAccountId) current.value = null
+    closeHistoryDelete(true)
+    historyDeleteAccountId.value = ''
+    notice.value = `已清除 ${result.deleted} 条历史记录`
+  } catch (e) {
+    const failure = e as Error & { status?: number }
+    if (failure.status === 409) {
+      historyDeleteStale.value = true
+      try { await refreshHistory() } catch (refreshError) { historyDeleteError.value = `历史已变化，刷新失败：${(refreshError as Error).message}`; return }
+      historyDeleteError.value = '历史记录已变化，已刷新列表，请关闭后重新选择并确认清除'
+    } else historyDeleteError.value = failure.message
+  } finally { loading.value = false }
+}
 async function reload() {
   error.value = ''; loading.value = true
   try {
@@ -57,14 +129,14 @@ async function reload() {
     await refreshHistory(); await loadModels()
   } catch (e) { error.value = (e as Error).message } finally { loading.value = false }
 }
-function changeMode() { selectedAccounts.value = selectedAccounts.value.filter(id => catalog.value.accounts.some(a => a.id === id && (mode.value !== 'probe' || (a.probe_supported && a.proxy_configured)))) }
-function selectAccounts() { selectedAccounts.value = visibleAccounts.value.filter(a => a.enabled && (mode.value !== 'probe' || (a.probe_supported && a.proxy_configured))).map(a => a.id) }
+function changeMode() { selectedAccounts.value = selectedAccounts.value.filter(id => catalog.value.accounts.some(a => a.id === id && (mode.value !== 'probe' || a.probe_supported))) }
+function selectAccounts() { selectedAccounts.value = visibleAccounts.value.filter(a => a.enabled && (mode.value !== 'probe' || a.probe_supported)).map(a => a.id) }
 async function run() {
   error.value = ''; notice.value = ''
   if (!selectedAccounts.value.length || !model.value.trim()) { error.value = '请选择账号与模型'; return }
   if (!key.value || !models.value.includes(model.value) || (mode.value === 'question' && !selectedQuestions.value.length)) { error.value = '请选择客户端Key、可见模型及测试题目'; return }
   const accounts = catalog.value.accounts.filter(a => selectedAccounts.value.includes(a.id))
-  if (accounts.some(a => !a.enabled || (mode.value === 'probe' && (!a.probe_supported || !a.proxy_configured)))) { error.value = '选中账号不支持当前测试，请重新选择'; return }
+  if (accounts.some(a => !a.enabled || (mode.value === 'probe' && !a.probe_supported))) { error.value = '选中账号不支持当前测试，请重新选择'; return }
   const tasks = mode.value === 'probe' ? [null] : [...selectedQuestions.value]
   const settings = { mode: mode.value, model: model.value.trim(), effort: mode.value === 'probe' ? 'default' : effort.value, client_key_id: key.value }
   batchId.value = crypto.randomUUID(); const id = batchId.value; total.value = accounts.length * tasks.length; completed.value = 0
@@ -127,9 +199,9 @@ onMounted(reload)
     <template v-if="tab === 'new'">
       <section class="panel">
         <div class="section-head"><nav class="segments" aria-label="测试类型"><button :class="{ active: mode === 'question' }" :disabled="running" @click="mode = 'question'">题目测试</button><button :class="{ active: mode === 'probe' }" :disabled="running" @click="mode = 'probe'; changeMode()">探针测试</button></nav>
-          <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>仅可重试故障自动重试，含初次最多3次；总计最多90秒，每次最多30秒，每次从首轮开始<br>账号须配置代理，代理失败不回退直连；令牌须在宿主刷新<br>Key仅限定范围，不经过Key计费／额度／租约链，探针模型使用实际上游名称且须在Key可见范围<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链，不自动重试</template></div></details>
+          <details><summary>测试说明</summary><div class="help"><template v-if="mode === 'probe'">仅适用于OpenAI OAuth<br>首轮门票加路由Cookie续接，返回不同门票标记为疑似降级<br>仅可重试故障自动重试，含初次最多3次；总计最多90秒，每次最多30秒，每次从首轮开始<br>未配置账号代理时使用服务器直连；已配置账号代理时固定使用账号代理，代理失败不回退直连<br>令牌须在宿主刷新<br>Key仅限定范围，不经过Key计费／额度／租约链，探针模型使用实际上游名称且须在Key可见范围<br>经验判据不是官方模型质量证明，响应模型名称不用于判定</template><template v-else>严格比较标准答案，仅忽略首尾空白和包裹整个答案的Markdown标记<br>调用失败不计为答错，单次答错不等于账号降级<br>题目测试通过宿主Key权限、租约与计费链，不自动重试</template></div></details>
         </div>
-        <div v-if="mode === 'probe'" class="alert warning">探针按所选Key限定账号与模型范围，强制使用账号代理，不计入Key账单 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
+        <div v-if="mode === 'probe'" class="alert warning">探针按所选Key限定账号与模型范围，未配置账号代理时使用服务器直连，已配置时固定使用账号代理，失败不回退直连，不计入Key账单 <button class="text-button" :disabled="running" @click="tab = 'monitor'">配置定时测试与自动停用</button></div>
         <fieldset :disabled="running || loading">
           <div class="form-grid">
             <label>客户端Key<select v-model="key" aria-label="客户端Key" @change="loadModels"><option value="">请选择</option><option v-for="k in catalog.keys.filter(k => k.enabled)" :key="k.id" :value="k.id">{{ k.name || k.id }}</option></select></label>
@@ -138,7 +210,7 @@ onMounted(reload)
             <label>同时测试账号数<select v-model="concurrency"><option v-for="n in 4" :key="n" :value="n">{{ n }}</option></select><small>不同账号可并行，同一账号始终串行，只选1个账号时不影响速度</small></label>
           </div>
           <div class="selection-header"><strong>账号 <span class="muted">已选 {{ selectedAccounts.length }}</span></strong><div class="inline"><input v-model="accountFilter" aria-label="筛选账号" placeholder="搜索账号"><button type="button" @click="selectAccounts">选择筛选结果</button><button type="button" @click="selectedAccounts = []">取消选择</button></div></div>
-          <div class="account-list"><label v-for="account in visibleAccounts" :key="account.id" class="choice"><input v-model="selectedAccounts" type="checkbox" :value="account.id" :disabled="!account.enabled || (mode === 'probe' && (!account.probe_supported || !account.proxy_configured))"><span>{{ account.name || account.id }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.provider }} · {{ account.authentication_kind }}{{ !account.enabled ? ' · 已停用' : mode === 'probe' && !account.probe_supported ? ' · 不适用或令牌过期' : mode === 'probe' && !account.proxy_configured ? ' · 未配置代理' : '' }}</small></span></label><p v-if="!visibleAccounts.length" class="empty">暂无匹配账号</p></div>
+          <div class="account-list"><label v-for="account in visibleAccounts" :key="account.id" class="choice"><input v-model="selectedAccounts" type="checkbox" :value="account.id" :disabled="!account.enabled || (mode === 'probe' && !account.probe_supported)"><span>{{ account.name || account.id }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.provider }} · {{ account.authentication_kind }}{{ !account.enabled ? ' · 已停用' : mode === 'probe' && !account.probe_supported ? ' · 不适用或令牌过期' : mode === 'probe' ? (account.proxy_configured ? ' · 账号代理' : ' · 服务器直连') : '' }}</small></span></label><p v-if="!visibleAccounts.length" class="empty">暂无匹配账号</p></div>
           <template v-if="mode === 'question'">
             <div class="selection-header"><strong>测试题目 <span class="muted">已选 {{ selectedQuestions.length }}</span></strong><div class="inline"><button type="button" @click="selectedQuestions = catalog.questions.map(q => q.id)">全选</button><button type="button" @click="selectedQuestions = []">取消选择</button></div></div>
             <div class="question-list"><label v-for="q in catalog.questions" :key="q.id" class="choice"><input v-model="selectedQuestions" type="checkbox" :value="q.id"><span>{{ q.title }}<small>{{ q.category }}</small></span></label></div>
@@ -162,11 +234,19 @@ onMounted(reload)
       </section>
       <section class="panel">
         <div class="section-head"><strong>{{ tab === 'history' ? '测试记录' : '本批次结果' }}</strong><div class="inline"><button :disabled="!displayedRecords.length" @click="download('json')">导出JSON</button><button :disabled="!displayedRecords.length" @click="download('csv')">导出CSV</button></div></div>
+        <div v-if="tab === 'history'" class="selection-header">
+          <strong>按账号清除历史</strong>
+          <div class="inline">
+            <select v-model="historyDeleteAccountId" aria-label="选择要清除历史的账号" :disabled="loading || running || !historyAccountOptions.length"><option value="">请选择账号</option><option v-for="option in historyAccountOptions" :key="option.id" :value="option.id">{{ option.name }} · {{ option.count }} 条</option></select>
+            <button :disabled="loading || running || !historyDeleteAccountId" @click="openHistoryDelete">清除历史</button>
+          </div>
+        </div>
         <p v-if="tab === 'history'" class="muted">最多保留100项，按60KiB消息帧预算自动移出最早非在途记录{{ evicted ? `，累计移出 ${evicted} 项，请及时导出` : '' }}</p>
         <div v-if="displayedRecords.length" class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>题目 / 探针</th><th>模型</th><th>结果</th><th>耗时</th><th>操作</th></tr></thead><tbody><tr v-for="r in displayedRecords" :key="r.id"><td class="nowrap">{{ time(r.started_at_ms) }}</td><td>{{ accountName(r.account_id, r.account_name) }}</td><td>{{ r.question_title || '门票探针' }}</td><td>{{ r.model }}<small v-if="r.mode === 'question'">{{ r.effort }}</small></td><td><span class="badge" :class="resultView(r).className">{{ resultView(r).label }}</span><small v-if="resultView(r).attempts">{{ resultView(r).attempts }}</small></td><td class="nowrap">{{ seconds(r.latency_ms) }}</td><td><button class="text-button" @click="current = r">详情</button></td></tr></tbody></table></div>
         <p v-else class="empty">{{ loading ? '正在加载' : '暂无测试结果' }}</p>
       </section>
     </template>
+    <div v-if="historyDeleteOpen" class="overlay" @click.self="closeHistoryDelete()"><section ref="historyDeleteDialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="history-delete-title" aria-describedby="history-delete-description" @keydown="trapHistoryDeleteFocus" @keydown.esc="closeHistoryDelete()"><div class="section-head"><strong id="history-delete-title">清除账号历史</strong><button :disabled="loading || running" @click="closeHistoryDelete()">关闭</button></div><p id="history-delete-description">确认清除「{{ historyDeleteName }}」的全部保留测试历史（{{ historyDeleteCount }} 条）？</p><p class="muted">包括旧失败和未确认记录，不会自动重测<br>仅清除测试记录，保留宿主账号、题库、监控任务及执行次数，清除后不可恢复</p><div v-if="historyDeleteError" class="alert error" role="alert">{{ historyDeleteError }}</div><div class="runbar"><span></span><div class="inline"><button :disabled="loading || running" @click="closeHistoryDelete()">取消</button><button class="danger" :disabled="loading || running || historyDeleteStale" @click="deleteHistory">{{ loading ? '清除中' : historyDeleteStale ? '请重新选择' : '确认清除' }}</button></div></div></section></div>
     <div v-if="current" class="overlay" @click.self="current = null"><section ref="dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title" @keydown="trapFocus" @keydown.esc="current = null"><div class="section-head"><strong id="detail-title">测试详情</strong><button @click="current = null">关闭</button></div><p><span class="badge" :class="resultView(current).className">{{ resultView(current).label }}</span> {{ current.detail }}</p><p class="muted">操作ID {{ current.id }}</p><template v-if="current.prompt"><h4>测试题目</h4><pre>{{ current.prompt }}</pre><h4>模型回答</h4><pre>{{ current.answer || '暂无完整回答' }}</pre><p>标准答案 {{ current.expected }}</p></template><ProbeDetails v-if="current.mode === 'probe'" :metrics="current.metrics" /><details><summary>原始执行指标</summary><pre>{{ JSON.stringify(current.metrics, null, 2) }}</pre></details></section></div>
   </main>
 </template>

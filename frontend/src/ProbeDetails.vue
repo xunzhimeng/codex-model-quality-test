@@ -13,7 +13,8 @@ function action(value?: string) { return ({ disabled: '账号已自动停用', p
   <div class="probe-details">
     <p class="muted">来源：{{ metrics.source === 'scheduled' ? '后台定时探针' : '手动探针' }}{{ metrics.monitor?.confirmation ? '（确认复测）' : '' }} · 门票与Cookie只展示存在性和长度，不保存原文</p>
     <p v-if="metrics.monitor?.task_name" class="muted">监控任务：{{ metrics.monitor.task_name }}</p>
-    <p v-if="metrics.transport === 'account_proxy'" class="muted">网络路径：账号代理 · Key仅限定范围，不计入账单</p>
+    <p v-if="metrics.transport === 'direct'" class="muted">网络路径：服务器直连 · Key仅限定范围，不计入账单</p>
+    <p v-else-if="metrics.transport === 'account_proxy'" class="muted">网络路径：账号代理 · Key仅限定范围，不计入账单</p>
     <p v-if="summary">{{ summary }}</p>
     <p v-if="unlistedFailure" class="alert error">{{ failureLabel(unlistedFailure) }}<small v-if="unlistedFailure.message !== failureLabel(unlistedFailure)">{{ unlistedFailure.message }}</small><small v-if="failureHints(unlistedFailure)">{{ failureHints(unlistedFailure) }}</small></p>
     <section v-for="(group, groupIndex) in groups" :key="group.number ?? `legacy-${groupIndex}`">
