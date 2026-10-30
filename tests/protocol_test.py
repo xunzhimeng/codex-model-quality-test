@@ -113,7 +113,7 @@ class Host:
         message,_ = self.messages.get(timeout=5)
         assert message['type'] == 'ready' and message['protocol_version'] == 7, message
         self.call_budgets=message['call_budgets']
-        assert self.call_budgets=={'management':120000,'maintenance':30000},message
+        assert self.call_budgets=={'management':120000,'maintenance':210000},message
         self.next_id = 11
         self.registration = self.call('management.register', stage='registration')
         # 先检查相对路由，再按注册表分发，避免桩直接接受宿主会拒绝的路径。
@@ -261,7 +261,7 @@ class Host:
         params={} if path is None else {'method':method,'path':path,'query':'','content_type':'application/json' if body is not None else None,'headers':[{'name':'authorization','value':list(b'fixture-admin-not-real')}]}
         self.write({'type':'call','id':id,'method':method if path is None else 'management.handle','context':{'call_id':id,'instance_id':'fixture','generation':1,'incarnation':'fixture-1','stage':stage,'timeout_ms':self.call_budgets.get(stage,5000 if stage=='registration' else 120000),'resource_stream':False,'resource_scope_id':str(id)},'params':params},dump(body) if body is not None else b'')
         while True:
-            msg,payload=self.messages.get(timeout=35)
+            msg,payload=self.messages.get(timeout=self.call_budgets.get(stage,35000)/1000+10)
             if msg['type']=='cancel': continue
             if msg['type']=='cancelled':
                 assert msg['id']==id,msg
@@ -1029,13 +1029,13 @@ class Integration(unittest.TestCase):
         self.configure_monitor();self.due();self.host.call('plugin.reconcile',stage='maintenance')
         self.host.stall_stream=True;self.due(confirmation=True);started=time.monotonic()
         self.host.call('plugin.reconcile',stage='maintenance')
-        elapsed=time.monotonic()-started;self.assertGreaterEqual(elapsed,17);self.assertLess(elapsed,29)
+        elapsed=time.monotonic()-started;self.assertGreaterEqual(elapsed,179);self.assertLess(elapsed,195)
         record=self.host.states['history']['value']['records'][-1]
         self.assertEqual(record['status'],'inconclusive')
         self.assertEqual(record['metrics']['attempt_count'],3)
         self.assertEqual(record['metrics']['failure']['kind'],'timeout')
-        self.assertGreaterEqual(record['metrics']['rounds'][0]['elapsed_ms'],5900)
-        self.assertLessEqual(record['metrics']['rounds'][0]['elapsed_ms'],6500)
+        self.assertGreaterEqual(record['metrics']['rounds'][0]['elapsed_ms'],59000)
+        self.assertLessEqual(record['metrics']['rounds'][0]['elapsed_ms'],62000)
         self.assertEqual(record['metrics']['retry_stop'],'max_attempts')
         self.assertEqual(self.task_state()['accounts']['fixture-account']['streak'],0)
         self.assertEqual(self.host.disable_count,0)
@@ -1316,12 +1316,12 @@ class Integration(unittest.TestCase):
         self.assertEqual(record['metrics']['failure']['http_status'],429)
     def test_http_429_body_timeout_keeps_retry_after_and_does_not_retry_early(self):
         self.configure_monitor(auto_disable=True)
-        self.host.http_responses=[{'status':429,'headers':{'Retry-After':'120'},'stall_body':True}]
+        self.host.http_responses=[{'status':429,'headers':{'Retry-After':'240'},'stall_body':True}]
         self.due();self.host.call('plugin.reconcile',stage='maintenance')
         record=self.host.states['history']['value']['records'][-1]
         self.assertEqual(record['metrics']['attempt_count'],1)
         self.assertEqual(record['metrics']['failure']['http_status'],429)
-        self.assertEqual(record['metrics']['failure']['retry_after_ms'],120000)
+        self.assertEqual(record['metrics']['failure']['retry_after_ms'],240000)
         self.assertEqual(record['metrics']['retry_stop'],'retry_after_exceeds_budget')
         self.assertEqual(self.host.proxy.connects,1);self.assertEqual(self.host.disable_count,0)
     def test_retry_after_wait_is_observed_before_success(self):
@@ -1334,10 +1334,18 @@ class Integration(unittest.TestCase):
         self.configure_monitor(auto_disable=True,daily_max=1)
         self.host.http_responses=[{'stall':True}]
         self.due();start=time.monotonic();self.host.call('plugin.reconcile',stage='maintenance')
-        self.assertGreaterEqual(time.monotonic()-start,6);self.assertLess(time.monotonic()-start,18)
+        self.assertGreaterEqual(time.monotonic()-start,60);self.assertLess(time.monotonic()-start,80)
         record=self.host.states['history']['value']['records'][-1]
         self.assertEqual(record['status'],'degraded');self.assertEqual(record['metrics']['attempt_count'],2)
         self.assertEqual(record['metrics']['attempts'][0]['failure']['kind'],'timeout')
+        self.assertEqual(self.monitor_snapshot()['daily_runs'],1);self.assertEqual(self.host.disable_count,0)
+    def test_background_slow_success_is_not_cut_off_by_old_six_second_attempt(self):
+        self.configure_monitor(auto_disable=False,daily_max=1)
+        self.host.http_responses=[{'delay':7},{}]
+        self.due();start=time.monotonic();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertGreaterEqual(time.monotonic()-start,7)
+        record=self.host.states['history']['value']['records'][-1]
+        self.assertEqual(record['status'],'degraded');self.assertEqual(record['metrics']['attempt_count'],1)
         self.assertEqual(self.monitor_snapshot()['daily_runs'],1);self.assertEqual(self.host.disable_count,0)
     def test_background_retry_failure_is_projected_without_persisting_duplicate_result(self):
         self.configure_monitor(auto_disable=True)

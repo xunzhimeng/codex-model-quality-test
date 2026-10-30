@@ -17,8 +17,8 @@ use gateway_plugin_sdk::{
 use std::sync::Arc;
 
 fn call_budgets() -> CallBudgets {
-    // 由插件声明入口预算，保持既有手动/后台上限并留出状态回写时间。
-    [(Stage::Management, 120_000), (Stage::Maintenance, 30_000)]
+    // 后台探针最多180秒，额外30秒供准入、状态回写与停用确认使用。
+    [(Stage::Management, 120_000), (Stage::Maintenance, 210_000)]
         .into_iter()
         .collect()
 }
@@ -144,11 +144,11 @@ mod tests {
     }
 
     #[test]
-    fn declared_budgets_keep_existing_entry_deadlines() {
+    fn declared_budgets_cover_background_probe_and_state_writeback() {
         let declarations = call_budgets();
         let resolved = gateway_plugin_sdk::ResolvedCallBudgets::resolve(&declarations).unwrap();
         assert_eq!(resolved.budget(Stage::Management).as_millis(), 120_000);
-        assert_eq!(resolved.budget(Stage::Maintenance).as_millis(), 30_000);
+        assert_eq!(resolved.budget(Stage::Maintenance).as_millis(), 210_000);
         assert_eq!(
             resolved.source(Stage::Management),
             gateway_plugin_sdk::CallBudgetSource::Plugin

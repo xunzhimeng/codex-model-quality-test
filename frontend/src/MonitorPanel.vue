@@ -23,7 +23,7 @@ function copySettings(value: Settings): Settings { return { ...value, account_id
 function time(value: number | null | undefined) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false, timeZone: snapshot.value?.timezone || 'Asia/Shanghai' }) : '—' }
 function name(id: string) { return props.accounts.find(a => a.id === id)?.name || id }
 function accountResult(status?: Status) { return resultView(status?.last_result || { status: status?.last_status || '' }) }
-function actionLabel(action: string) { return ({ pending: '停用待确认', disabled: '已自动停用', unconfirmed: '停用未确认' } as Record<string, string>)[action] || '无停用动作' }
+function actionLabel(action: string) { return ({ pending: '停用待确认', disabled: '已自动停用', unconfirmed: '停用未确认' } as Record<string, string>)[action] || '—' }
 function taskStatus(task: Task) { return !task.state.settings.scheduled ? '未启用' : task.state.paused ? '已暂停' : '运行中' }
 function failure(e: unknown) {
   const message = (e as Error).message
@@ -87,7 +87,7 @@ async function save() {
   busy.value = true; error.value = ''; notice.value = ''
   try {
     snapshot.value = await request<Snapshot>('monitor', { task_id: editingId.value, name: taskName.value.trim(), settings: copySettings(value), expected_generation: editGeneration.value })
-    notice.value = '任务已保存，确认命中已清零，执行次数保留'
+    notice.value = '已保存，复测命中清零'
     dialog.value?.close()
   } catch (e) { editorError.value = failure(e) } finally { busy.value = false }
 }
@@ -110,7 +110,7 @@ async function deleteTask() {
   busy.value = true; deleteError.value = ''; error.value = ''; notice.value = ''
   try {
     snapshot.value = await request<Snapshot>('monitor/delete', { task_id: task.id, expected_generation: task.state.generation, expected_control_revision: task.state.control_revision })
-    notice.value = '任务已删除，测试历史保留，账号启用状态未改变'
+    notice.value = '任务已删除'
     deleteDialog.value?.close()
   } catch (e) { deleteError.value = (e as Error).message } finally { busy.value = false }
 }
@@ -122,7 +122,7 @@ async function toggleScheduled(task: Task) {
   busy.value = true; error.value = ''; notice.value = ''
   try {
     snapshot.value = await request<Snapshot>('monitor', { task_id: task.id, name: task.name, settings: value, expected_generation: task.state.generation })
-    notice.value = value.scheduled ? '任务已启用，暂停状态保留，首轮按所设间隔执行' : '任务已关闭，自动停用已关闭，已发出的操作不撤回'
+    notice.value = value.scheduled ? `任务已启用${task.state.paused ? '，仍为暂停状态' : ''}` : '任务已关闭，自动停用已关闭'
   } catch (e) { error.value = failure(e) } finally { busy.value = false }
 }
 async function control(paused: boolean, task: Task | null = null, accountId: string | null = null) {
@@ -130,7 +130,7 @@ async function control(paused: boolean, task: Task | null = null, accountId: str
   busy.value = true; error.value = ''; notice.value = ''
   try {
     snapshot.value = await request<Snapshot>('monitor/control', { task_id: task?.id || null, account_id: accountId, paused, expected_generation: task?.state.generation || '', expected_control_revision: task?.state.control_revision ?? snapshot.value.control_revision })
-    notice.value = paused ? '监控已暂停，已发出的操作不撤回，确认命中已清零' : accountId ? '账号已继续，仍受任务启用、暂停、时段及限额约束' : '监控已继续，未启用的任务不会执行，仍遵守时段及每日上限'
+    notice.value = paused ? '已暂停，复测命中清零' : '已继续'
   } catch (e) { error.value = failure(e) } finally { busy.value = false }
 }
 onMounted(load)
@@ -148,14 +148,13 @@ onMounted(load)
       </div>
     </div>
     <div v-if="error" role="alert" class="alert error">{{ error }}</div>
-    <div v-if="notice" role="status" class="alert success">{{ notice }}</div>
-    <p v-if="snapshot" class="muted">累计执行 {{ snapshot.total_runs }} 次 · 今日执行 {{ snapshot.daily_runs }} 次 · 北京时间（含曾监控账号）</p>
+    <div class="monitor-summary muted"><span v-if="snapshot">累计 {{ snapshot.total_runs }} · 今日 {{ snapshot.daily_runs }} · 北京时间</span><span v-if="notice" role="status">{{ notice }}</span></div>
     <p v-if="!snapshot" class="empty">{{ busy ? '正在加载任务' : '未加载监控状态，请刷新重试' }}</p>
     <p v-else-if="!snapshot.tasks.length" class="empty">暂无监控任务</p>
     <div v-else class="monitor-task-list">
       <article v-for="task in snapshot.tasks" :key="task.id" class="monitor-task">
         <div class="section-head">
-          <div class="monitor-task-title"><strong>{{ task.name }}</strong> <span class="badge">{{ taskStatus(task) }}</span><small>{{ task.state.settings.model || '未选择模型' }} · 每 {{ task.state.settings.interval_minutes }} 分钟 · {{ task.state.settings.account_ids.length }} 个账号 · {{ task.state.settings.auto_disable ? '自动停用已开启' : '不自动停用' }}</small></div>
+          <div class="monitor-task-title"><strong>{{ task.name }}</strong><span class="badge">{{ taskStatus(task) }}</span><span class="muted">{{ task.state.settings.model || '未选模型' }} · {{ task.state.settings.interval_minutes }} 分钟 · {{ task.state.settings.account_ids.length }} 账号 · {{ task.state.settings.auto_disable ? '自动停用' : '仅监测' }} · 累计 {{ task.total_runs }} / 今日 {{ task.daily_runs }} · 日限 {{ task.state.settings.daily_max }}/账号 · 检查 {{ time(task.state.last_tick_ms) }}</span></div>
           <div class="inline">
             <button :disabled="busy" :aria-label="'编辑任务 ' + task.name" @click="openEditor(task, $event)">编辑</button>
             <button class="danger" :disabled="busy" :aria-label="'删除任务 ' + task.name" @click="openDelete(task, $event)">删除</button>
@@ -163,15 +162,14 @@ onMounted(load)
             <button :disabled="busy || !task.state.settings.scheduled" :aria-label="(task.state.paused ? '继续任务 ' : '暂停任务 ') + task.name" @click="control(!task.state.paused, task)">{{ task.state.paused ? '继续' : '暂停' }}</button>
           </div>
         </div>
-        <p class="muted">累计 {{ task.total_runs }} 次 · 今日 {{ task.daily_runs }} 次 · 最近后台检查 {{ time(task.state.last_tick_ms) }}</p>
         <div v-if="task.state.last_error" role="alert" class="alert warning">{{ task.state.last_error }}</div>
-        <details>
+        <details open>
           <summary>账号详情（{{ task.state.settings.account_ids.length }}）</summary>
           <div v-if="task.state.settings.account_ids.length" class="table-wrap monitor-accounts"><table><thead><tr><th>账号</th><th>监控状态</th><th>累计 / 今日次数</th><th>最近测试</th><th>结果</th><th>降级命中</th><th>下次可执行</th><th>账号处置</th><th>操作</th></tr></thead><tbody>
             <tr v-for="id in task.state.settings.account_ids" :key="id">
               <td>{{ name(id) }}</td><td>{{ task.availability[id]?.status || '尚未执行' }}</td>
-              <td>{{ task.state.accounts[id]?.total_runs || 0 }} / {{ task.state.accounts[id]?.daily_runs || 0 }}<small>本任务今日上限 {{ task.state.settings.daily_max }}</small></td>
-              <td>{{ time(task.state.accounts[id]?.last_checked_ms) }}</td><td><span class="badge" :class="accountResult(task.state.accounts[id]).className">{{ accountResult(task.state.accounts[id]).label }}</span><small v-if="accountResult(task.state.accounts[id]).attempts">{{ accountResult(task.state.accounts[id]).attempts }}</small></td>
+              <td>{{ task.state.accounts[id]?.total_runs || 0 }} / {{ task.state.accounts[id]?.daily_runs || 0 }}</td>
+              <td>{{ time(task.state.accounts[id]?.last_checked_ms) }}</td><td><span class="monitor-result"><span class="badge" :class="accountResult(task.state.accounts[id]).className">{{ accountResult(task.state.accounts[id]).label }}</span><span v-if="accountResult(task.state.accounts[id]).attempts" class="muted">{{ accountResult(task.state.accounts[id]).attempts }}</span></span></td>
               <td>{{ task.state.accounts[id]?.streak || 0 }} / {{ task.state.settings.degradation_policy === 'immediate' ? 1 : 2 }}</td>
               <td>{{ time(task.availability[id]?.next_allowed_ms) }}</td><td>{{ actionLabel(task.state.accounts[id]?.action || '') }}<small>{{ task.state.accounts[id]?.action_detail }}</small></td>
               <td><button :disabled="busy || !task.state.settings.scheduled" :aria-label="(task.state.accounts[id]?.paused ? '继续监控 ' : '暂停监控 ') + task.name + ' / ' + name(id)" @click="control(!task.state.accounts[id]?.paused, task, id)">{{ task.state.accounts[id]?.paused ? '继续' : '暂停' }}</button></td>
@@ -181,16 +179,12 @@ onMounted(load)
         </details>
       </article>
     </div>
-    <details class="question-preview"><summary>后台执行与安全边界</summary><div class="help">
-      <p>最多10个任务，同一账号在多任务间串行执行，次数与每日限额按每任务每账号独立统计，旧计划升级后迁为暂停任务，请确认设置后继续</p>
-      <p>关闭页面后，宿主维护任务仍继续执行，停用插件后停止，每次维护最多测试一个到期账号，繁忙时顺延</p>
-      <p>预约确认由后续维护回调执行，等待不少于配置秒数，不保证精确到秒，确认等待期间不启动同账号的常规探针，确认到期后超过一个常规间隔或跨过不测试时段则作废，不以陈旧结果停用</p>
-      <p>暂停或保存会清空确认链，不撤回已发出的请求，继续后按常规间隔执行，关闭任务同时关闭自动停用，重新启用后需编辑任务开启自动停用</p>
-      <p>执行次数按后台准入次数统计，内部重试不另计次，已准入但失败或取消仍计次，保存、暂停及进程重启不清空次数，每日上限包含确认复测，达到上限后次日恢复，不测试时段不补发堆积任务</p>
-      <p>手动探针和题目测试不参与监控判定，超时、限流、认证失败或未取得判定不触发自动停用，自动停用作用于宿主账号，也会影响其他任务</p>
-      <p>探针仅对可重试故障自动重试，含初次最多3次；后台总计最多18秒、每次最多6秒，手动总计最多90秒、每次最多30秒；取消会停止内部执行，不撤回已发出的请求</p>
-      <p>停用动作未确认时不自动重发，需在账号管理核对，账号不会自动恢复</p>
-      <p>探针按Key限定账号与模型范围；未配置账号代理时使用服务器直连，已配置时固定使用账号代理，代理失败不回退直连，不计入Key账单，不自动刷新令牌，敏感导出仅限所选单账号和本次调用内存，敏感内容不返回页面、不写状态或日志</p>
+    <details class="question-preview"><summary>执行说明</summary><div class="help">
+      <p>关闭页面仍会执行，每轮维护处理一个到期账号，同账号串行，繁忙时顺延</p>
+      <p>后台总预算180秒，每次最多60秒，含初次最多3次尝试并遵守Retry-After，整轮计1次，确认复测另计1次，仍受每日上限和禁测时段约束</p>
+      <p>暂停或保存会清空确认链，不撤回已发请求，继续后按间隔执行，关闭任务同时关闭自动停用</p>
+      <p>仅疑似降级按策略停用，超时或错误不触发停用，停用影响宿主账号且不会自动恢复，未确认动作需在账号管理核对</p>
+      <p>未配置代理时服务器直连，已配置则固定走账号代理，失败不回退，Key仅限定范围不计账单，令牌需在宿主刷新</p>
     </div></details>
   </section>
 
@@ -233,18 +227,27 @@ onMounted(load)
 .danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); background: color-mix(in srgb, var(--danger) 7%, var(--surface)); }
 .monitor-delete { color: var(--text); width: min(480px, calc(100% - 24px)); overflow-wrap: anywhere; }
 .monitor-delete::backdrop { background: #0006; }
-.monitor-task { padding: 16px 0; border-top: 1px solid var(--border); }
-.monitor-task .section-head { margin-bottom: 8px; }
-.monitor-task-title { min-width: 0; overflow-wrap: anywhere; }
-.monitor-task-title .badge { margin-left: 6px; }
-.monitor-accounts { margin-top: 10px; }
-.monitor-accounts table { min-width: 960px; }
+.monitor-summary { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 10px; }
+.monitor-summary [role=status] { color: var(--primary); }
+.monitor-task { padding: 12px 0; border-top: 1px solid var(--border); }
+.monitor-task .section-head { margin-bottom: 8px; flex-wrap: wrap; }
+.monitor-task-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; overflow-wrap: anywhere; flex: 1; }
+.monitor-task-title > .muted { line-height: 1.8; }
+.monitor-accounts { margin-top: 8px; }
+.monitor-accounts table { min-width: 1100px; }
+.monitor-accounts th, .monitor-accounts td { padding: 9px 8px; }
+.monitor-accounts td:not(:first-child) { white-space: nowrap; }
+.monitor-result { display: inline-flex; align-items: center; gap: 8px; }
+.monitor-accounts td small { white-space: normal; }
 .monitor-editor { color: var(--text); width: min(960px, calc(100% - 40px)); max-width: 960px; }
 .monitor-editor::backdrop { background: #0006; }
 .monitor-editor .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .help p { margin: 0 0 10px; }
 .help p:last-child { margin-bottom: 0; }
-@media (max-width: 900px) { .monitor-editor .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 900px) {
+  .monitor-task-title { flex-basis: 100%; }
+  .monitor-editor .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 560px) {
   .monitor-task .section-head { align-items: flex-start; }
   .monitor-editor { width: calc(100% - 20px); max-height: 90vh; padding: 12px; }

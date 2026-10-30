@@ -195,7 +195,7 @@ onMounted(reload)
       <button :disabled="loading || running" @click="reload">{{ loading ? '正在加载' : '刷新' }}</button>
     </div>
     <div v-if="error" class="alert error" role="alert">{{ error }}</div>
-    <div v-if="notice" class="alert success" role="status">{{ notice }}</div>
+    <div v-if="notice && tab !== 'monitor'" class="alert success" role="status">{{ notice }}</div>
     <template v-if="tab === 'new'">
       <section class="panel">
         <div class="section-head"><nav class="segments" aria-label="测试类型"><button :class="{ active: mode === 'question' }" :disabled="running" @click="mode = 'question'">题目测试</button><button :class="{ active: mode === 'probe' }" :disabled="running" @click="mode = 'probe'; changeMode()">探针测试</button></nav>

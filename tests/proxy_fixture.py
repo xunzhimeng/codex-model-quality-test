@@ -79,7 +79,8 @@ class ProxyFixture:
                         status=scripted.get('status',owner.http_status)
                         if owner.on_stream:owner.on_stream()
                         if owner.stall_stream or scripted.get('stall'):
-                            fixture.stop.wait(28);return
+                            fixture.stop.wait(220);return
+                        if scripted.get('delay') and fixture.stop.wait(scripted['delay']):return
                         if 'body' in scripted:body=scripted['body']
                         elif status != 200: body=json.dumps(scripted.get('error',owner.error_body) or {'error':{'code':'fixture_rejected','message':'fixture refusal'}}).encode()
                         elif owner.bad_stream:body=b'data: {"type":"response.failed"}\n\n'
@@ -88,7 +89,7 @@ class ProxyFixture:
                         extra=''.join(f'{name}: {value}\r\n' for name,value in scripted.get('headers',{}).items())
                         response=f'HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {len(body)}\r\nx-codex-turn-state: {ticket}\r\nSet-Cookie: __oailb=route-fixture; Secure; HttpOnly\r\nSet-Cookie: other=not-forwarded; Secure\r\n{extra}Connection: close\r\n\r\n'.encode()+body
                         if scripted.get('stall_body'):
-                            stream.sendall(response[:-len(body)]);fixture.stop.wait(28);return
+                            stream.sendall(response[:-len(body)]);fixture.stop.wait(220);return
                         stream.sendall(response);reader.close()
                 except Exception as error:
                     if not fixture.stop.is_set():fixture.errors.append(type(error).__name__)

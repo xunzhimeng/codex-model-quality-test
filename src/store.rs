@@ -63,6 +63,8 @@ pub async fn get<T: DeserializeOwned + Default>(
 // 当前协议沿用业务JSON的payload前缀；沿用60KiB业务预算，避免升级时无故淘汰策略变化。
 pub const STATE_FRAME_BUDGET: usize = 60 * 1024;
 const PENDING_RESULT_RESERVE: usize = 1024;
+// 覆盖最长210秒维护入口及取消回收窗口，供历史淘汰和后台预约共同使用。
+pub(crate) const PENDING_PROTECTION_MS: u64 = 240_000;
 
 pub fn state_metadata_bytes(key: &str, value: &impl Serialize) -> Result<usize, String> {
     let params = serde_json::to_value(StatePutRequest {
@@ -190,7 +192,10 @@ impl History {
             let pending = self
                 .records
                 .iter()
-                .filter(|r| r.status == "running" && now.saturating_sub(r.started_at_ms) < 150_000)
+                .filter(|r| {
+                    r.status == "running"
+                        && now.saturating_sub(r.started_at_ms) < PENDING_PROTECTION_MS
+                })
                 .count();
             // 初始凭证与完成结果都检查真实封装字节，为在途操作的容量失败终态预留空间。
             let finalizing = usize::from(
@@ -208,7 +213,8 @@ impl History {
                 .iter()
                 .position(|r| {
                     r.id != protected_id
-                        && (r.status != "running" || now.saturating_sub(r.started_at_ms) >= 150_000)
+                        && (r.status != "running"
+                            || now.saturating_sub(r.started_at_ms) >= PENDING_PROTECTION_MS)
                 })
                 .ok_or("历史容量不足，请等待在途测试结束；本次未发送上游")?;
             self.records.remove(index);
@@ -349,6 +355,26 @@ mod tests {
             }
         }
         assert!(history.evicted > 0);
+    }
+    #[test]
+    fn retention_protects_background_record_beyond_old_deadline() {
+        let now = now_ms();
+        let mut history = History::default();
+        history
+            .records
+            .push(record("slow-background", "running", now - 180_000));
+        for i in 0..100 {
+            history
+                .records
+                .push(record(&format!("finished-{i}"), "correct", now));
+        }
+        history.compact(now, "finished-99").unwrap();
+        assert_eq!(history.records.len(), 100);
+        assert!(history.records.iter().any(|r| r.id == "slow-background"));
+        assert!(!history.records.iter().any(|r| r.id == "finished-0"));
+        history.records.push(record("new", "correct", now));
+        history.compact(now + PENDING_PROTECTION_MS, "new").unwrap();
+        assert!(!history.records.iter().any(|r| r.id == "slow-background"));
     }
     #[test]
     fn oversized_result_is_explicit_terminal_failure_not_stuck_or_truncated_success() {

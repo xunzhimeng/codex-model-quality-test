@@ -12,7 +12,6 @@ use tokio::sync::Mutex;
 const MINUTE: u64 = 60_000;
 const DAY: u64 = 1440 * MINUTE;
 const OFFSET: u64 = 480 * MINUTE;
-const RUN_LEASE: u64 = 150_000;
 fn day(now: u64) -> u64 {
     now.saturating_add(OFFSET) / DAY
 }
@@ -566,10 +565,9 @@ impl Monitor {
         let now = now_ms();
         // 不丢弃在途凭证或未确认停用意图，否则其他任务可能重叠请求或重复提交停用。
         if state.accounts.values().any(|status| {
-            status
-                .active
-                .as_ref()
-                .is_some_and(|run| now.saturating_sub(run.started_ms) < RUN_LEASE)
+            status.active.as_ref().is_some_and(|run| {
+                now.saturating_sub(run.started_ms) < store::PENDING_PROTECTION_MS
+            })
         }) {
             return Err("任务仍有执行中或隔离中的测试，请先暂停，等待结束后再删除".into());
         }
@@ -799,11 +797,9 @@ impl Monitor {
                 let state = &mut task.state;
                 state.last_tick_ms = Some(now);
                 for status in state.accounts.values_mut() {
-                    if status
-                        .active
-                        .as_ref()
-                        .is_some_and(|run| now.saturating_sub(run.started_ms) >= RUN_LEASE)
-                    {
+                    if status.active.as_ref().is_some_and(|run| {
+                        now.saturating_sub(run.started_ms) >= store::PENDING_PROTECTION_MS
+                    }) {
                         status.active = None;
                         status.reset_confirmation();
                         status.last_status = "interrupted".into();
@@ -893,7 +889,7 @@ impl Monitor {
             client_key_id: job.4,
             question_id: None,
         };
-        let result = app.run(host, request, 18, Some(job.3.clone()), true).await;
+        let result = app.run(host, request, 180, Some(job.3.clone()), true).await;
         if let Err(error) = result {
             let _guard = self.lock.lock().await;
             let (mut registry, version) = self.load(host).await?;
@@ -918,6 +914,18 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservation_outlives_declared_maintenance_call() {
+        let budgets =
+            gateway_plugin_sdk::ResolvedCallBudgets::resolve(&crate::call_budgets()).unwrap();
+        assert!(
+            store::PENDING_PROTECTION_MS as u128
+                > budgets
+                    .budget(gateway_plugin_sdk::Stage::Maintenance)
+                    .as_millis()
+        );
+    }
     #[test]
     fn quiet_hours_cross_midnight_and_beijing_day_boundary() {
         let now = |h: u64, m: u64| (10 * DAY + h * 60 * MINUTE + m * MINUTE) - OFFSET;
