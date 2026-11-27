@@ -3,10 +3,16 @@ use crate::{
     app::{App, RunRequest},
     store::{self, Record, now_ms},
 };
-use gateway_plugin_sdk::client::HostClient;
+use gateway_plugin_sdk::{
+    call::services::usage::{ListRecords, ListUsageRecords, UsageRecordFilter},
+    client::HostClient,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 use tokio::sync::Mutex;
 
 const MINUTE: u64 = 60_000;
@@ -108,6 +114,8 @@ pub struct Settings {
     pub degradation_policy: DegradationPolicy,
     #[serde(default = "default_confirmation_delay")]
     pub confirmation_delay_seconds: u32,
+    #[serde(default)]
+    pub idle_backoff: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -122,6 +130,7 @@ impl Default for Settings {
             daily_max: default_daily_max(),
             degradation_policy: DegradationPolicy::default(),
             confirmation_delay_seconds: default_confirmation_delay(),
+            idle_backoff: false,
         }
     }
 }
@@ -224,6 +233,8 @@ pub struct AccountState {
     pub count_day: u64,
     pub confirm_due_ms: Option<u64>,
     pub active: Option<ActiveRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_deferred_since_ms: Option<u64>,
 }
 impl AccountState {
     fn today(&self, now: u64) -> u64 {
@@ -305,6 +316,44 @@ fn bounded_error(error: String) -> String {
         .filter(|ch| !ch.is_control())
         .take(120)
         .collect()
+}
+
+const MAX_USAGE_CHECKS_PER_TICK: usize = 50;
+const USAGE_CHECK_STAGE_BUDGET: Duration = Duration::from_secs(5);
+
+// 查询该账号在 [start_ms, end_ms] 内是否存在主机模型请求记录；查询失败返回 None 以保守按原节奏执行。
+async fn account_has_requests(
+    host: &HostClient,
+    account_id: &str,
+    start_ms: u64,
+    end_ms: u64,
+    budget: Duration,
+) -> Option<bool> {
+    if start_ms > end_ms || budget.is_zero() {
+        return None;
+    }
+    let start_ms = i64::try_from(start_ms).ok()?;
+    let end_ms = i64::try_from(end_ms.saturating_add(1)).ok()?;
+    let request = ListUsageRecords {
+        filter: UsageRecordFilter {
+            start_ms,
+            end_ms,
+            provider: None,
+            model: None,
+            account_ref: Some(account_id.to_owned()),
+            client_key_ref: None,
+        },
+        cursor: None,
+        limit: Some(1),
+    };
+    let page = tokio::time::timeout(
+        budget.min(Duration::from_secs(2)),
+        host.service::<ListRecords>(request),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(!page.items.is_empty())
 }
 impl Registry {
     fn validate_capacity(&self) -> Result<(), String> {
@@ -413,6 +462,8 @@ impl Monitor {
                 "不测试时段"
             } else if status.confirm_due_ms.is_some() {
                 "等待确认复测"
+            } else if state.settings.idle_backoff && status.idle_deferred_since_ms.is_some() {
+                "空闲延长等待"
             } else {
                 "等待常规测试"
             };
@@ -459,7 +510,21 @@ impl Monitor {
     pub async fn save(&self, host: &HostClient, request: Save) -> Result<Value, String> {
         request.settings.validate()?;
         if request.settings.scheduled {
+            let scope = crate::key_scope::Scope::load(
+                host,
+                request
+                    .settings
+                    .client_key_id
+                    .as_deref()
+                    .unwrap_or_default(),
+                &request.settings.model,
+            )
+            .await?;
+            let info_map = accounts::list(host).await?;
             for id in &request.settings.account_ids {
+                let info = info_map
+                    .get(id)
+                    .ok_or("部分监控账号已从宿主移除，请取消勾选后再保存")?;
                 let account: gateway_plugin_sdk::call::host::AuthRuntimeAccount =
                     store::payload_call(
                         host,
@@ -469,20 +534,12 @@ impl Monitor {
                         },
                     )
                     .await?;
-                let info = accounts::get(host, id).await?;
-                crate::key_scope::check(
-                    host,
-                    request
-                        .settings
-                        .client_key_id
-                        .as_deref()
-                        .unwrap_or_default(),
-                    &request.settings.model,
-                    &info,
-                )
-                .await?;
                 if account.provider_id != "openai" || account.authentication_kind != "oauth" {
                     return Err("监控仅支持OpenAI OAuth账号".into());
+                }
+                // 已停用账号在后台执行时会自动跳过，不应在编辑任务时阻塞保存。
+                if info.enabled && account.enabled {
+                    scope.check_account(info)?;
                 }
             }
         }
@@ -531,6 +588,7 @@ impl Monitor {
         // 计数和停用审计与设置代次分离，保存、移除后重新选择都不能清掉当日额度。
         for status in state.accounts.values_mut() {
             status.reset_confirmation();
+            status.idle_deferred_since_ms = None;
         }
         for id in &state.settings.account_ids {
             state.accounts.entry(id.clone()).or_default().next_due_ms =
@@ -624,6 +682,7 @@ impl Monitor {
             for id in ids {
                 if let Some(status) = state.accounts.get_mut(&id) {
                     status.reset_confirmation();
+                    status.idle_deferred_since_ms = None;
                     if !request.paused {
                         status.next_due_ms =
                             now_ms() + u64::from(state.settings.interval_minutes) * MINUTE;
@@ -720,6 +779,7 @@ impl Monitor {
                 == record.metrics.get("client_key_id").and_then(Value::as_str);
         status.streak = 0;
         status.confirm_due_ms = None;
+        status.idle_deferred_since_ms = None;
         status.next_due_ms = now + u64::from(state.settings.interval_minutes) * MINUTE;
         let policy = state.settings.degradation_policy;
         let threshold = policy.threshold();
@@ -789,14 +849,19 @@ impl Monitor {
         store::put(host, "monitor", &registry, version).await
     }
     pub async fn tick(&self, app: &App, host: &HostClient) -> Result<(), String> {
-        let job = {
+        let mut due_results: BTreeMap<(String, String, String), Option<bool>> = BTreeMap::new();
+        let mut deferred_results: BTreeMap<(String, String, String, u64), Option<bool>> =
+            BTreeMap::new();
+        let mut did_usage_phase = false;
+        let job = loop {
             let _guard = self.lock.lock().await;
             let (mut registry, version) = self.load(host).await?;
             let now = now_ms();
+            let mut restored: BTreeSet<(String, String)> = BTreeSet::new();
             for task in &mut registry.tasks {
                 let state = &mut task.state;
                 state.last_tick_ms = Some(now);
-                for status in state.accounts.values_mut() {
+                for (id, status) in &mut state.accounts {
                     if status.active.as_ref().is_some_and(|run| {
                         now.saturating_sub(run.started_ms) >= store::PENDING_PROTECTION_MS
                     }) {
@@ -815,6 +880,32 @@ impl Monitor {
                     }) {
                         status.reset_confirmation();
                     }
+                    // 延长等待期间出现新请求记录时，恢复常规间隔并允许本轮立即执行。
+                    if !state.settings.idle_backoff {
+                        status.idle_deferred_since_ms = None;
+                    } else if did_usage_phase
+                        && state.settings.scheduled
+                        && !state.paused
+                        && !status.paused
+                        && status.active.is_none()
+                        && status.confirm_due_ms.is_none()
+                        && let Some(deferred_at) = status.idle_deferred_since_ms
+                        && status.next_due_ms > now
+                        && deferred_results
+                            .get(&(
+                                task.id.clone(),
+                                state.generation.clone(),
+                                id.clone(),
+                                deferred_at,
+                            ))
+                            .copied()
+                            .flatten()
+                            == Some(true)
+                    {
+                        status.idle_deferred_since_ms = None;
+                        status.next_due_ms = deferred_at.min(now);
+                        restored.insert((task.id.clone(), id.clone()));
+                    }
                 }
             }
             // 跨任务共享账号互斥；未结束预约在重启后同样阻止其他任务重叠发送。
@@ -826,6 +917,7 @@ impl Monitor {
                 .map(|(id, _)| id.clone())
                 .collect();
             let mut due = Vec::new();
+            let mut deferred = Vec::new();
             for (index, task) in registry.tasks.iter().enumerate() {
                 let state = &task.state;
                 if !state.settings.scheduled || state.paused {
@@ -835,19 +927,116 @@ impl Monitor {
                     let Some(status) = state.accounts.get(id) else {
                         continue;
                     };
-                    let at = status.confirm_due_ms.unwrap_or(status.next_due_ms);
-                    if !status.paused
-                        && !active.contains(id)
-                        && !app.account_busy(id)
-                        && at <= now
-                        && state.settings.release(now, status) == now
+                    if status.paused
+                        || active.contains(id)
+                        || app.account_busy(id)
+                        || state.settings.release(now, status) != now
                     {
+                        continue;
+                    }
+                    let at = status.confirm_due_ms.unwrap_or(status.next_due_ms);
+                    if at <= now {
                         due.push((at, index, id.clone()));
+                    } else if state.settings.idle_backoff
+                        && status.confirm_due_ms.is_none()
+                        && let Some(deferred_at) = status.idle_deferred_since_ms
+                    {
+                        deferred.push((
+                            deferred_at,
+                            task.id.clone(),
+                            state.generation.clone(),
+                            id.clone(),
+                        ));
                     }
                 }
             }
             due.sort();
-            let Some((_, index, id)) = due.into_iter().next() else {
+            if !did_usage_phase {
+                let mut due_plan = Vec::new();
+                for &(_, index, ref id) in &due {
+                    let task = &registry.tasks[index];
+                    let status = &task.state.accounts[id];
+                    if task.state.settings.idle_backoff
+                        && status.confirm_due_ms.is_none()
+                        && status.idle_deferred_since_ms.is_none()
+                    {
+                        let interval = u64::from(task.state.settings.interval_minutes) * MINUTE;
+                        due_plan.push((
+                            task.id.clone(),
+                            task.state.generation.clone(),
+                            id.clone(),
+                            now.saturating_sub(interval),
+                        ));
+                    }
+                }
+                deferred.sort();
+                if !due_plan.is_empty() || !deferred.is_empty() {
+                    // 释放状态锁后再查宿主请求记录，避免阻塞并发管理接口。
+                    drop(_guard);
+                    let end = now_ms();
+                    let deadline = Instant::now() + USAGE_CHECK_STAGE_BUDGET;
+                    let mut cache: BTreeMap<(String, u64), Option<bool>> = BTreeMap::new();
+                    let mut remaining = MAX_USAGE_CHECKS_PER_TICK;
+                    for (task_id, generation, id, start) in due_plan {
+                        let key = (id.clone(), start);
+                        let result = if let Some(&cached) = cache.get(&key) {
+                            cached
+                        } else if remaining > 0 {
+                            remaining -= 1;
+                            let budget = deadline.saturating_duration_since(Instant::now());
+                            let queried = account_has_requests(host, &id, start, end, budget).await;
+                            cache.insert(key, queried);
+                            queried
+                        } else {
+                            None
+                        };
+                        due_results.insert((task_id, generation, id), result);
+                    }
+                    for (deferred_at, task_id, generation, id) in deferred {
+                        let key = (id.clone(), deferred_at);
+                        let result = if let Some(&cached) = cache.get(&key) {
+                            cached
+                        } else if remaining > 0 {
+                            remaining -= 1;
+                            let budget = deadline.saturating_duration_since(Instant::now());
+                            let queried =
+                                account_has_requests(host, &id, deferred_at, end, budget).await;
+                            cache.insert(key, queried);
+                            queried
+                        } else {
+                            None
+                        };
+                        deferred_results.insert((task_id, generation, id, deferred_at), result);
+                    }
+                    did_usage_phase = true;
+                    continue;
+                }
+            }
+            let mut selected = None;
+            for (_, index, id) in due {
+                let task = &mut registry.tasks[index];
+                let state = &mut task.state;
+                let interval = u64::from(state.settings.interval_minutes) * MINUTE;
+                let status = state.accounts.get_mut(&id).unwrap();
+                if status.confirm_due_ms.is_none()
+                    && state.settings.idle_backoff
+                    && status.idle_deferred_since_ms.is_none()
+                    && !restored.contains(&(task.id.clone(), id.clone()))
+                    && due_results
+                        .get(&(task.id.clone(), state.generation.clone(), id.clone()))
+                        .copied()
+                        .flatten()
+                        == Some(false)
+                {
+                    // 最近一个间隔内无请求，本轮不发探针、不计次数，最多延长至2倍间隔。
+                    status.idle_deferred_since_ms = Some(now);
+                    status.next_due_ms = now + interval;
+                    continue;
+                }
+                selected = Some((index, id));
+                break;
+            }
+            let Some((index, id)) = selected else {
                 store::put(host, "monitor", &registry, version).await?;
                 return Ok(());
             };
@@ -856,6 +1045,7 @@ impl Monitor {
             let status = state.accounts.get_mut(&id).unwrap();
             let request_id = uuid::Uuid::new_v4().to_string();
             let confirmation = status.confirm_due_ms.take().is_some();
+            status.idle_deferred_since_ms = None;
             status.active = Some(ActiveRun {
                 id: request_id.clone(),
                 started_ms: now,
@@ -877,7 +1067,7 @@ impl Monitor {
                 state.settings.client_key_id.clone(),
             );
             store::put(host, "monitor", &registry, version).await?;
-            job
+            break job;
         };
         let request = RunRequest {
             id: job.1.clone(),
@@ -1034,6 +1224,7 @@ mod tests {
                     status.last_status = "inconclusive".into();
                     status.last_checked_ms = Some(u64::MAX);
                     status.confirm_due_ms = Some(u64::MAX);
+                    status.idle_deferred_since_ms = Some(u64::MAX);
                     status.action = "unconfirmed".into();
                     status.action_detail = "错".repeat(120);
                     status.active = Some(ActiveRun {

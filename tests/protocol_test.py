@@ -74,6 +74,10 @@ class Host:
         self.client_profile={'originator':'Codex Desktop','codexVersion':'0.153.4','userAgent':'Codex Desktop/0.153.4 (Mac OS 15.7.1; arm64) unknown (Codex Desktop; 26.901.51231)'}
         self.profile_error=False
         self.identity_snapshots=[]
+        self.usage_records=[]
+        self.usage_error=False
+        self.usage_queries=[]
+        self.account_exists=True
         self.process = subprocess.Popen([str(ROOT/'target/debug'/('model-quality-test.exe' if os.name=='nt' else 'model-quality-test'))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,env={**os.environ,'SSL_CERT_FILE':str(self.proxy.ca_path)})
         self.messages = queue.Queue()
         self.states = {}
@@ -172,9 +176,12 @@ class Host:
         account={'account_id':'fixture-account','provider_id':'openai','credential_revision':1,'name':'OpenAI 账号','email':'fixture@example.test','upstream_user_id':None,'upstream_account_id':'fixture-upstream','plan_type':'plus','authentication_kind':'oauth','enabled':self.account_enabled,'credential_state':'ready','has_refresh_token':False,'access_token_expires_at_ms':None,'next_refresh_at_ms':None}
         if method.startswith('host.auth.'):
             assert params=={}; request=json.loads(body)
-            if method=='host.auth.list': payload=dump({'accounts':[account],'next_cursor':None})
+            if method=='host.auth.list': payload=dump({'accounts':[account] if self.account_exists else [],'next_cursor':None})
             elif method=='host.auth.get_runtime':
                 if self.on_account_read:self.on_account_read()
+                if not self.account_exists or request.get('account_id')!='fixture-account':
+                    self.write({'type':'error','id':msg['id'],'error':{'code':'invalid_input','message':'account not found','send_state':'not_sent'}})
+                    return
                 payload=dump(account)
             else:raise AssertionError('unexpected credential read '+method)
         elif method=='host.data.keys.get':
@@ -187,12 +194,31 @@ class Host:
             assert not body; assert params['client_key_id']=='fixture-key'
             result={'models':self.model_names if self.model_visible else []}
         elif method=='host.services.call':
-            assert not body and params=={'operation':'settings.preview_client_profile','input':['openai',None]}
-            if self.profile_error:
-                result={'Err':{'kind':'unavailable','message':'fixture-profile-secret'}}
+            assert not body
+            op=params.get('operation')
+            if op=='settings.preview_client_profile':
+                assert params=={'operation':'settings.preview_client_profile','input':['openai',None]}
+                if self.profile_error:
+                    result={'Err':{'kind':'unavailable','message':'fixture-profile-secret'}}
+                else:
+                    self.identity_snapshots.append(dict(self.client_profile))
+                    result={'Ok':self.client_profile}
+            elif op=='usage.records.list':
+                query=params['input']
+                self.usage_queries.append(query)
+                if self.usage_error:
+                    result={'Err':{'kind':'unavailable','message':'fixture-usage-error'}}
+                else:
+                    flt=query['filter']
+                    assert flt['start_ms'] < flt['end_ms'] and query['limit']==1
+                    matched=[
+                        r for r in self.usage_records
+                        if (flt.get('account_ref') is None or r['data'].get('account_ref')==flt['account_ref'])
+                        and flt['start_ms'] <= r['data']['started_at_ms'] < flt['end_ms']
+                    ][:query['limit']]
+                    result={'Ok':{'items':matched,'next_cursor':None}}
             else:
-                self.identity_snapshots.append(dict(self.client_profile))
-                result={'Ok':self.client_profile}
+                raise AssertionError('unexpected service operation '+str(op))
         elif method=='host.state.get':
             assert not body; assert params['namespace']=='quality'
             result={'record':self.states.get(params['key'])}
@@ -224,7 +250,8 @@ class Host:
             if uri.path=='/api/admin/accounts':
                 assert params['method']=='GET' and not body
                 assert set(parse_qs(uri.query))=={'page','pageSize'}
-                data={'items':[{'id':'fixture-account','name':'OpenAI 账号','email':'fixture@example.test','notes':self.account_notes,'enabled':self.account_enabled,'groups':[{'id':'fixture-group'}],'modelAccess':self.model_policy,'outboundProxyEndpoint':'http://127.0.0.1' if self.proxy_configured else None}], 'page':{'totalPages':1}}
+                items=[{'id':'fixture-account','name':'OpenAI 账号','email':'fixture@example.test','notes':self.account_notes,'enabled':self.account_enabled,'groups':[{'id':'fixture-group'}],'modelAccess':self.model_policy,'outboundProxyEndpoint':'http://127.0.0.1' if self.proxy_configured else None}] if self.account_exists else []
+                data={'items':items, 'page':{'totalPages':1}}
             elif uri.path=='/api/admin/account-groups':
                 assert set(parse_qs(uri.query))=={'page','pageSize'}
                 data={'items':[{'id':'fixture-group','enabled':self.group_enabled}],'page':{'totalPages':1}}
@@ -1384,6 +1411,71 @@ class Integration(unittest.TestCase):
         record=self.run_request('fixture-probe-no-ticket','probe')[1]['record']
         self.assertEqual(record['metrics']['failure']['kind'],'missing_ticket');self.assertEqual(record['metrics']['attempt_count'],3)
         self.assertEqual(record['status'],'inconclusive')
+    def test_save_monitor_allows_disabled_account_and_rejects_removed_account(self):
+        config=self.configure_monitor(auto_disable=True,degradation_policy='immediate')
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertFalse(self.host.account_enabled)
+        snapshot=self.monitor_snapshot()
+        updated={**snapshot['state']['settings'],'interval_minutes':15}
+        status,saved=self.save_monitor({'settings':updated,'expected_generation':snapshot['state']['generation']})
+        self.assertEqual(status,200,saved)
+        self.assertEqual(saved['state']['settings']['interval_minutes'],15)
+        self.assertEqual(saved['state']['settings']['account_ids'],['fixture-account'])
+        # 已从宿主移除的账号仍应阻止保存并提示取消勾选。
+        self.host.account_exists=False
+        status,err=self.save_monitor({'settings':saved['state']['settings'],'expected_generation':saved['state']['generation']})
+        self.assertEqual(status,400,err);self.assertIn('取消勾选',err['error'])
+        self.host.account_exists=True
+        # 启用账号仍执行Key与模型策略校验。
+        self.host.account_enabled=True;self.host.model_policy={'mode':'denylist','models':['fixture-model']}
+        status,_=self.save_monitor({'settings':saved['state']['settings'],'expected_generation':saved['state']['generation']})
+        self.assertEqual(status,400)
+    def test_idle_backoff_defers_once_restores_on_new_request_and_keeps_confirmation(self):
+        def usage_record(started_ms,account='fixture-account'):
+            return {'id':f'req-{started_ms}','data':{'client_key_ref':'fixture-key','provider':'openai','account_ref':account,'requested_model':'fixture-model','model':'fixture-model','protocol':'openai','operation':'responses','endpoint':'/v1/responses','client_transport':'http_sse','service_tier':None,'started_at_ms':started_ms,'completed_at_ms':started_ms+10,'outcome':'succeeded','tokens':{'input_tokens':'10','output_tokens':'5','cached_input_tokens':None,'cache_write_input_tokens':None,'reasoning_output_tokens':None,'image_input_tokens':None,'image_output_tokens':None,'total_tokens':'15'},'cost':{'kind':'unavailable'}},'billing_snapshot':None,'provider_observation':None}
+        # 默认不开启空闲延长时不查用量记录。
+        self.configure_monitor(auto_disable=False,interval_minutes=10)
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.host.usage_queries,[]);self.assertEqual(self.monitor_snapshot()['total_runs'],1)
+        # 开启空闲延长且无请求：首次到期推迟一个间隔，不发探针、不计次。
+        self.configure_monitor(auto_disable=False,interval_minutes=10,idle_backoff=True)
+        self.due();before=int(time.time()*1000)
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(len(self.host.usage_queries),1)
+        self.assertEqual(self.monitor_snapshot()['total_runs'],1)
+        self.assertEqual(self.host.proxy.connects,2)
+        snap=self.monitor_snapshot()
+        self.assertEqual(snap['availability']['fixture-account']['status'],'空闲延长等待')
+        status=self.task_state()['accounts']['fixture-account']
+        self.assertIsNotNone(status['idle_deferred_since_ms'])
+        self.assertGreaterEqual(status['next_due_ms'],before+10*60*1000-2000)
+        # 延长等待期内仍无新请求：再次tick不发探针。
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],1)
+        # 延长等待期内出现新请求记录：恢复并立即执行探针。
+        self.host.usage_records.append(usage_record(int(time.time()*1000)))
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],2)
+        self.assertIsNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
+        # 确认复测不受空闲延长影响（即使此时无新请求也立即复测）。
+        self.host.usage_records.clear()
+        self.assertIsNotNone(self.task_state()['accounts']['fixture-account']['confirm_due_ms'])
+        self.due(confirmation=True)
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],3)
+        # 再次空闲：推迟到2倍间隔后即使仍无请求也只推迟一次并执行探针。
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],3)
+        self.assertIsNotNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],4)
+        self.assertIsNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
+    def test_idle_backoff_falls_back_when_usage_query_fails(self):
+        self.configure_monitor(auto_disable=False,interval_minutes=10,idle_backoff=True)
+        self.host.usage_error=True;self.due()
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],1)
+        self.assertIsNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
     def test_custom_bank_compare_and_swap(self):
         q={'id':'custom_sum','title':'加法','category':'数学','prompt':'17+28，只输出整数','answer':'45'}
         self.assertEqual(self.host.call('POST','questions',{'questions':[q],'expected_version':None})[0],200)

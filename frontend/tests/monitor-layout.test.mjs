@@ -21,4 +21,6 @@ test('监控成功提示使用紧凑状态行，不显示旧手动批次横幅',
   assert.doesNotMatch(monitor, /class="alert success"/)
   assert.ok(monitor.includes('已保存，复测命中清零'))
   assert.ok(monitor.includes('清空确认链，不撤回已发请求'))
+  assert.ok(monitor.includes('空闲时延长至2倍间隔'))
+  assert.ok(monitor.includes('已从宿主移除，请取消勾选'))
 })

@@ -3,8 +3,8 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { request, type Account, type Key, type TestRecord } from './api'
 import { resultView } from './result'
 import { useModels } from './models'
-interface Settings { scheduled: boolean; auto_disable: boolean; interval_minutes: number; model: string; client_key_id: string | null; account_ids: string[]; daily_max: number; quiet_hours: { start: string; end: string } | null; degradation_policy: 'confirm' | 'immediate'; confirmation_delay_seconds: number }
-interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string; paused: boolean; total_runs: number; daily_runs: number; confirm_due_ms: number | null; last_result?: TestRecord | null }
+interface Settings { scheduled: boolean; auto_disable: boolean; interval_minutes: number; model: string; client_key_id: string | null; account_ids: string[]; daily_max: number; quiet_hours: { start: string; end: string } | null; degradation_policy: 'confirm' | 'immediate'; confirmation_delay_seconds: number; idle_backoff: boolean }
+interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string; paused: boolean; total_runs: number; daily_runs: number; confirm_due_ms: number | null; idle_deferred_since_ms?: number | null; last_result?: TestRecord | null }
 interface State { generation: string; settings: Settings; accounts: Record<string, Status>; last_tick_ms: number | null; last_error: string | null; paused: boolean; control_revision: number }
 interface Task { id: string; name: string; state: State; availability: Record<string, { status: string; next_allowed_ms: number | null }>; total_runs: number; daily_runs: number }
 interface Snapshot { tasks: Task[]; defaults: Settings; total_runs: number; daily_runs: number; timezone: string; now_ms: number; control_revision: number }
@@ -17,9 +17,10 @@ let previousFocus: HTMLElement | null = null
 const quietEnabled = computed({ get: () => !!settings.value?.quiet_hours, set: enabled => { if (settings.value) settings.value.quiet_hours = enabled ? { start: '23:00', end: '07:00' } : null } })
 const { models, modelsLoading, modelsError, loadModels } = useModels(() => settings.value?.client_key_id || null, computed({ get: () => settings.value?.model || '', set: value => { if (settings.value) settings.value.model = value } }))
 const candidates = computed(() => props.accounts.filter(a => a.provider === 'openai' && a.authentication_kind === 'oauth' && `${a.name} ${a.email || ''} ${a.id}`.toLowerCase().includes(filter.value.toLowerCase())))
+const missingAccountIds = computed(() => (settings.value?.account_ids || []).filter(id => !props.accounts.some(a => a.id === id)))
 const editedTask = computed(() => snapshot.value?.tasks.find(task => task.id === editingId.value))
 const staleEditor = computed(() => editingId.value !== null && (!editedTask.value || editedTask.value.state.generation !== editGeneration.value))
-function copySettings(value: Settings): Settings { return { ...value, account_ids: [...value.account_ids], quiet_hours: value.quiet_hours ? { ...value.quiet_hours } : null } }
+function copySettings(value: Settings): Settings { return { ...value, idle_backoff: Boolean(value.idle_backoff), account_ids: [...value.account_ids], quiet_hours: value.quiet_hours ? { ...value.quiet_hours } : null } }
 function time(value: number | null | undefined) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false, timeZone: snapshot.value?.timezone || 'Asia/Shanghai' }) : '—' }
 function name(id: string) { return props.accounts.find(a => a.id === id)?.name || id }
 function accountResult(status?: Status) { return resultView(status?.last_result || { status: status?.last_status || '' }) }
@@ -154,7 +155,7 @@ onMounted(load)
     <div v-else class="monitor-task-list">
       <article v-for="task in snapshot.tasks" :key="task.id" class="monitor-task">
         <div class="section-head">
-          <div class="monitor-task-title"><strong>{{ task.name }}</strong><span class="badge">{{ taskStatus(task) }}</span><span class="muted">{{ task.state.settings.model || '未选模型' }} · {{ task.state.settings.interval_minutes }} 分钟 · {{ task.state.settings.account_ids.length }} 账号 · {{ task.state.settings.auto_disable ? '自动停用' : '仅监测' }} · 累计 {{ task.total_runs }} / 今日 {{ task.daily_runs }} · 日限 {{ task.state.settings.daily_max }}/账号 · 检查 {{ time(task.state.last_tick_ms) }}</span></div>
+          <div class="monitor-task-title"><strong>{{ task.name }}</strong><span class="badge">{{ taskStatus(task) }}</span><span class="muted">{{ task.state.settings.model || '未选模型' }} · {{ task.state.settings.interval_minutes }} 分钟{{ task.state.settings.idle_backoff ? `（空闲 ${task.state.settings.interval_minutes * 2} 分钟）` : '' }} · {{ task.state.settings.account_ids.length }} 账号 · {{ task.state.settings.auto_disable ? '自动停用' : '仅监测' }} · 累计 {{ task.total_runs }} / 今日 {{ task.daily_runs }} · 日限 {{ task.state.settings.daily_max }}/账号 · 检查 {{ time(task.state.last_tick_ms) }}</span></div>
           <div class="inline">
             <button :disabled="busy" :aria-label="'编辑任务 ' + task.name" @click="openEditor(task, $event)">编辑</button>
             <button class="danger" :disabled="busy" :aria-label="'删除任务 ' + task.name" @click="openDelete(task, $event)">删除</button>
@@ -182,6 +183,7 @@ onMounted(load)
     <details class="question-preview"><summary>执行说明</summary><div class="help">
       <p>关闭页面仍会执行，每轮维护处理一个到期账号，同账号串行，繁忙时顺延</p>
       <p>后台总预算180秒，每次最多60秒，含初次最多3次尝试并遵守Retry-After，整轮计1次，确认复测另计1次，仍受每日上限和禁测时段约束</p>
+      <p>开启空闲延长后，最近一个间隔无该账号请求则推迟至2倍间隔且不计次，期间有新请求恢复原间隔，不影响确认复测</p>
       <p>暂停或保存会清空确认链，不撤回已发请求，继续后按间隔执行，关闭任务同时关闭自动停用</p>
       <p>仅疑似降级按策略停用，超时或错误不触发停用，停用影响宿主账号且不会自动恢复，未确认动作需在账号管理核对</p>
       <p>未配置代理时服务器直连，已配置则固定走账号代理，失败不回退，Key仅限定范围不计账单，令牌需在宿主刷新</p>
@@ -204,7 +206,7 @@ onMounted(load)
       <div v-if="editorError" role="alert" class="alert error">{{ editorError }}</div>
       <fieldset :disabled="busy">
         <label>任务名称<input v-model="taskName" required aria-label="任务名称"></label>
-        <div class="inline monitor-toggles"><label class="choice"><input v-model="settings.scheduled" type="checkbox" @change="!settings.scheduled && (settings.auto_disable = false)">启用定时探针</label><label class="choice"><input v-model="settings.auto_disable" type="checkbox" :disabled="!settings.scheduled">启用自动停用账号</label></div>
+        <div class="inline monitor-toggles"><label class="choice"><input v-model="settings.scheduled" type="checkbox" @change="!settings.scheduled && (settings.auto_disable = false)">启用定时探针</label><label class="choice"><input v-model="settings.auto_disable" type="checkbox" :disabled="!settings.scheduled">启用自动停用账号</label><label class="choice"><input v-model="settings.idle_backoff" type="checkbox">空闲时延长至2倍间隔</label></div>
         <div v-if="settings.auto_disable" class="alert warning">仅明确疑似降级时触发停用，{{ settings.degradation_policy === 'immediate' ? '立即停用不复测，误停风险较高' : '等待后复测仍疑似降级才停用' }}，账号不会自动恢复</div>
         <div class="form-grid">
           <label>监控客户端Key<select v-model="settings.client_key_id" aria-label="监控客户端Key" @change="loadModels"><option :value="null">请选择</option><option v-for="key in props.keys.filter(k => k.enabled || k.id === settings?.client_key_id)" :key="key.id" :value="key.id">{{ key.name || key.id }}{{ key.enabled ? '' : '（已停用）' }}</option></select></label>
@@ -215,7 +217,7 @@ onMounted(load)
         <div class="form-grid"><label>每日每账号最大测试次数<input v-model.number="settings.daily_max" type="number" aria-label="每日每账号最大测试次数" min="1" max="1440" step="1"><small>一次探针任务计1次，确认复测另计1次</small></label><label class="choice"><input v-model="quietEnabled" type="checkbox">启用不测试时段</label><div v-if="settings.quiet_hours" class="inline"><label>不测试开始<input v-model="settings.quiet_hours.start" type="time" aria-label="不测试开始" required></label><label>不测试结束<input v-model="settings.quiet_hours.end" type="time" aria-label="不测试结束" required></label></div></div>
         <p class="muted">北京时间每日零点重置，时段可跨午夜，限制优先于复测，手动探针不计数、不触发自动停用</p>
         <div class="selection-header"><strong>监控账号 <span class="muted">已选 {{ settings.account_ids.length }} / 50</span></strong><div class="inline"><input v-model="filter" aria-label="筛选监控账号" placeholder="搜索名称、邮箱"><button type="button" @click="settings.account_ids = candidates.filter(a => a.enabled && a.probe_supported).slice(0, 50).map(a => a.id)">选择筛选结果</button><button type="button" @click="settings.account_ids = []">取消选择</button></div></div>
-        <div class="account-list"><label v-for="account in candidates" :key="account.id" class="choice"><input v-model="settings.account_ids" type="checkbox" :value="account.id" :disabled="!settings.account_ids.includes(account.id) && (!account.enabled || !account.probe_supported || settings.account_ids.length >= 50)"><span>{{ account.name }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.enabled ? (!account.probe_supported ? 'OpenAI OAuth · 不适用或令牌过期' : account.proxy_configured ? 'OpenAI OAuth · 账号代理已配置' : 'OpenAI OAuth · 服务器直连') : '已停用，将跳过' }}</small></span></label><p v-if="!candidates.length" class="empty">暂无匹配的OpenAI OAuth账号</p></div>
+        <div class="account-list"><label v-for="id in missingAccountIds" :key="id" class="choice"><input v-model="settings.account_ids" type="checkbox" :value="id"><span>{{ id }}<small>已从宿主移除，请取消勾选</small></span></label><label v-for="account in candidates" :key="account.id" class="choice"><input v-model="settings.account_ids" type="checkbox" :value="account.id" :disabled="!settings.account_ids.includes(account.id) && (!account.enabled || !account.probe_supported || settings.account_ids.length >= 50)"><span>{{ account.name }}<small>{{ account.email && account.email !== account.name ? account.email + ' · ' : '' }}{{ account.enabled ? (!account.probe_supported ? 'OpenAI OAuth · 不适用或令牌过期' : account.proxy_configured ? 'OpenAI OAuth · 账号代理已配置' : 'OpenAI OAuth · 服务器直连') : '已停用，将跳过' }}</small></span></label><p v-if="!candidates.length && !missingAccountIds.length" class="empty">暂无匹配的OpenAI OAuth账号</p></div>
       </fieldset>
       <div class="runbar"><button type="button" :disabled="busy" @click="reloadTask">{{ editingId === null ? '重载默认设置' : '重载任务' }}</button><div class="inline"><button type="button" @click="dialog?.close()">取消</button><button class="primary" type="submit" :disabled="busy || modelsLoading || staleEditor">{{ busy ? '处理中' : '保存任务' }}</button></div></div>
     </form>
