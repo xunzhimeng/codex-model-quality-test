@@ -4,7 +4,7 @@ import { request, type Account, type Key, type TestRecord } from './api'
 import { resultView } from './result'
 import { useModels } from './models'
 interface Settings { scheduled: boolean; auto_disable: boolean; interval_minutes: number; model: string; client_key_id: string | null; account_ids: string[]; daily_max: number; quiet_hours: { start: string; end: string } | null; degradation_policy: 'confirm' | 'immediate'; confirmation_delay_seconds: number; idle_backoff: boolean }
-interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string; paused: boolean; total_runs: number; daily_runs: number; confirm_due_ms: number | null; idle_deferred_since_ms?: number | null; last_result?: TestRecord | null }
+interface Status { next_due_ms: number; streak: number; last_status: string; last_checked_ms: number | null; action: string; action_detail: string; paused: boolean; total_runs: number; daily_runs: number; confirm_due_ms: number | null; idle_deferred_since_ms?: number | null; idle_backoff_level?: number; last_result?: TestRecord | null }
 interface State { generation: string; settings: Settings; accounts: Record<string, Status>; last_tick_ms: number | null; last_error: string | null; paused: boolean; control_revision: number }
 interface Task { id: string; name: string; state: State; availability: Record<string, { status: string; next_allowed_ms: number | null }>; total_runs: number; daily_runs: number }
 interface Snapshot { tasks: Task[]; defaults: Settings; total_runs: number; daily_runs: number; timezone: string; now_ms: number; control_revision: number }
@@ -155,7 +155,7 @@ onMounted(load)
     <div v-else class="monitor-task-list">
       <article v-for="task in snapshot.tasks" :key="task.id" class="monitor-task">
         <div class="section-head">
-          <div class="monitor-task-title"><strong>{{ task.name }}</strong><span class="badge">{{ taskStatus(task) }}</span><span class="muted">{{ task.state.settings.model || '未选模型' }} · {{ task.state.settings.interval_minutes }} 分钟{{ task.state.settings.idle_backoff ? `（空闲 ${task.state.settings.interval_minutes * 2} 分钟）` : '' }} · {{ task.state.settings.account_ids.length }} 账号 · {{ task.state.settings.auto_disable ? '自动停用' : '仅监测' }} · 累计 {{ task.total_runs }} / 今日 {{ task.daily_runs }} · 日限 {{ task.state.settings.daily_max }}/账号 · 检查 {{ time(task.state.last_tick_ms) }}</span></div>
+          <div class="monitor-task-title"><strong>{{ task.name }}</strong><span class="badge">{{ taskStatus(task) }}</span><span class="muted">{{ task.state.settings.model || '未选模型' }} · {{ task.state.settings.interval_minutes }} 分钟{{ task.state.settings.idle_backoff ? `（空闲最高 ${task.state.settings.interval_minutes * 8} 分钟）` : '' }} · {{ task.state.settings.account_ids.length }} 账号 · {{ task.state.settings.auto_disable ? '自动停用' : '仅监测' }} · 累计 {{ task.total_runs }} / 今日 {{ task.daily_runs }} · 日限 {{ task.state.settings.daily_max }}/账号 · 检查 {{ time(task.state.last_tick_ms) }}</span></div>
           <div class="inline">
             <button :disabled="busy" :aria-label="'编辑任务 ' + task.name" @click="openEditor(task, $event)">编辑</button>
             <button class="danger" :disabled="busy" :aria-label="'删除任务 ' + task.name" @click="openDelete(task, $event)">删除</button>
@@ -183,7 +183,7 @@ onMounted(load)
     <details class="question-preview"><summary>执行说明</summary><div class="help">
       <p>关闭页面仍会执行，每轮维护处理一个到期账号，同账号串行，繁忙时顺延</p>
       <p>后台总预算180秒，每次最多60秒，含初次最多3次尝试并遵守Retry-After，整轮计1次，确认复测另计1次，仍受每日上限和禁测时段约束</p>
-      <p>开启空闲延长后，最近一个间隔无该账号请求则推迟至2倍间隔且不计次，期间有新请求恢复原间隔，不影响确认复测</p>
+      <p>开启空闲延长后，无该账号请求时逐级翻倍（2/4/8倍，最多3次）且不计次，有新请求恢复原间隔，不影响确认复测</p>
       <p>暂停或保存会清空确认链，不撤回已发请求，继续后按间隔执行，关闭任务同时关闭自动停用</p>
       <p>仅疑似降级按策略停用，超时或错误不触发停用，停用影响宿主账号且不会自动恢复，未确认动作需在账号管理核对</p>
       <p>未配置代理时服务器直连，已配置则固定走账号代理，失败不回退，Key仅限定范围不计账单，令牌需在宿主刷新</p>
@@ -206,7 +206,7 @@ onMounted(load)
       <div v-if="editorError" role="alert" class="alert error">{{ editorError }}</div>
       <fieldset :disabled="busy">
         <label>任务名称<input v-model="taskName" required aria-label="任务名称"></label>
-        <div class="inline monitor-toggles"><label class="choice"><input v-model="settings.scheduled" type="checkbox" @change="!settings.scheduled && (settings.auto_disable = false)">启用定时探针</label><label class="choice"><input v-model="settings.auto_disable" type="checkbox" :disabled="!settings.scheduled">启用自动停用账号</label><label class="choice"><input v-model="settings.idle_backoff" type="checkbox">空闲时延长至2倍间隔</label></div>
+        <div class="inline monitor-toggles"><label class="choice"><input v-model="settings.scheduled" type="checkbox" @change="!settings.scheduled && (settings.auto_disable = false)">启用定时探针</label><label class="choice"><input v-model="settings.auto_disable" type="checkbox" :disabled="!settings.scheduled">启用自动停用账号</label><label class="choice"><input v-model="settings.idle_backoff" type="checkbox">空闲时逐级翻倍（最多3次）</label></div>
         <div v-if="settings.auto_disable" class="alert warning">仅明确疑似降级时触发停用，{{ settings.degradation_policy === 'immediate' ? '立即停用不复测，误停风险较高' : '等待后复测仍疑似降级才停用' }}，账号不会自动恢复</div>
         <div class="form-grid">
           <label>监控客户端Key<select v-model="settings.client_key_id" aria-label="监控客户端Key" @change="loadModels"><option :value="null">请选择</option><option v-for="key in props.keys.filter(k => k.enabled || k.id === settings?.client_key_id)" :key="key.id" :value="key.id">{{ key.name || key.id }}{{ key.enabled ? '' : '（已停用）' }}</option></select></label>

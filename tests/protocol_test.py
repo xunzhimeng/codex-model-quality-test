@@ -1430,14 +1430,14 @@ class Integration(unittest.TestCase):
         self.host.account_enabled=True;self.host.model_policy={'mode':'denylist','models':['fixture-model']}
         status,_=self.save_monitor({'settings':saved['state']['settings'],'expected_generation':saved['state']['generation']})
         self.assertEqual(status,400)
-    def test_idle_backoff_defers_once_restores_on_new_request_and_keeps_confirmation(self):
+    def test_idle_backoff_doubles_up_to_three_times_restores_on_new_request_and_keeps_confirmation(self):
         def usage_record(started_ms,account='fixture-account'):
             return {'id':f'req-{started_ms}','data':{'client_key_ref':'fixture-key','provider':'openai','account_ref':account,'requested_model':'fixture-model','model':'fixture-model','protocol':'openai','operation':'responses','endpoint':'/v1/responses','client_transport':'http_sse','service_tier':None,'started_at_ms':started_ms,'completed_at_ms':started_ms+10,'outcome':'succeeded','tokens':{'input_tokens':'10','output_tokens':'5','cached_input_tokens':None,'cache_write_input_tokens':None,'reasoning_output_tokens':None,'image_input_tokens':None,'image_output_tokens':None,'total_tokens':'15'},'cost':{'kind':'unavailable'}},'billing_snapshot':None,'provider_observation':None}
         # 默认不开启空闲延长时不查用量记录。
         self.configure_monitor(auto_disable=False,interval_minutes=10)
         self.due();self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.host.usage_queries,[]);self.assertEqual(self.monitor_snapshot()['total_runs'],1)
-        # 开启空闲延长且无请求：首次到期推迟一个间隔，不发探针、不计次。
+        # 开启空闲延长且无请求：首次到期翻倍至2倍（+10m），不发探针、不计次。
         self.configure_monitor(auto_disable=False,interval_minutes=10,idle_backoff=True)
         self.due();before=int(time.time()*1000)
         self.host.call('plugin.reconcile',stage='maintenance')
@@ -1445,31 +1445,56 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.monitor_snapshot()['total_runs'],1)
         self.assertEqual(self.host.proxy.connects,2)
         snap=self.monitor_snapshot()
-        self.assertEqual(snap['availability']['fixture-account']['status'],'空闲延长等待')
+        self.assertEqual(snap['availability']['fixture-account']['status'],'空闲延长（2倍）')
         status=self.task_state()['accounts']['fixture-account']
         self.assertIsNotNone(status['idle_deferred_since_ms'])
+        self.assertEqual(status['idle_backoff_level'],1)
         self.assertGreaterEqual(status['next_due_ms'],before+10*60*1000-2000)
-        # 延长等待期内仍无新请求：再次tick不发探针。
+        # 延长等待期内仍无新请求：未到期时再次tick不发探针，级别不变。
         self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.monitor_snapshot()['total_runs'],1)
-        # 延长等待期内出现新请求记录：恢复并立即执行探针。
+        self.assertEqual(self.task_state()['accounts']['fixture-account']['idle_backoff_level'],1)
+        # 延长等待期内出现新请求记录：恢复并立即执行探针，翻倍级数归零。
         self.host.usage_records.append(usage_record(int(time.time()*1000)))
         self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.monitor_snapshot()['total_runs'],2)
-        self.assertIsNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
+        status=self.task_state()['accounts']['fixture-account']
+        self.assertIsNone(status.get('idle_deferred_since_ms'))
+        self.assertEqual(status.get('idle_backoff_level',0),0)
         # 确认复测不受空闲延长影响（即使此时无新请求也立即复测）。
         self.host.usage_records.clear()
         self.assertIsNotNone(self.task_state()['accounts']['fixture-account']['confirm_due_ms'])
         self.due(confirmation=True)
         self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.monitor_snapshot()['total_runs'],3)
-        # 再次空闲：推迟到2倍间隔后即使仍无请求也只推迟一次并执行探针。
-        self.due();self.host.call('plugin.reconcile',stage='maintenance')
-        self.assertEqual(self.monitor_snapshot()['total_runs'],3)
-        self.assertIsNotNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
+        # 持续空闲：逐级翻倍3次（2倍/+10m、4倍/+20m、8倍/+40m），第4次到期执行探针。
+        for expected_level,expected_minutes in [(1,10),(2,20),(3,40)]:
+            self.due();before=int(time.time()*1000)
+            self.host.call('plugin.reconcile',stage='maintenance')
+            self.assertEqual(self.monitor_snapshot()['total_runs'],3)
+            snap=self.monitor_snapshot()
+            self.assertEqual(snap['availability']['fixture-account']['status'],f'空闲延长（{1<<expected_level}倍）')
+            status=self.task_state()['accounts']['fixture-account']
+            self.assertEqual(status['idle_backoff_level'],expected_level)
+            self.assertGreaterEqual(status['next_due_ms'],before+expected_minutes*60*1000-2000)
+            self.assertLessEqual(status['next_due_ms'],before+expected_minutes*60*1000+5000)
+        # 已达3次上限后再次到期：直接执行探针并重置空闲状态。
+        self.host.ticket_second='ticket-first'
+        queries_before=len(self.host.usage_queries)
         self.due();self.host.call('plugin.reconcile',stage='maintenance')
         self.assertEqual(self.monitor_snapshot()['total_runs'],4)
-        self.assertIsNone(self.task_state()['accounts']['fixture-account'].get('idle_deferred_since_ms'))
+        self.assertEqual(len(self.host.usage_queries),queries_before)
+        status=self.task_state()['accounts']['fixture-account']
+        self.assertIsNone(status.get('idle_deferred_since_ms'))
+        self.assertEqual(status.get('idle_backoff_level',0),0)
+        # 翻倍到4倍等待期间出现新请求，同样立即恢复原间隔并执行探针。
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.due();self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.task_state()['accounts']['fixture-account']['idle_backoff_level'],2)
+        self.host.usage_records.append(usage_record(int(time.time()*1000)))
+        self.host.call('plugin.reconcile',stage='maintenance')
+        self.assertEqual(self.monitor_snapshot()['total_runs'],5)
+        self.assertEqual(self.task_state()['accounts']['fixture-account'].get('idle_backoff_level',0),0)
     def test_idle_backoff_falls_back_when_usage_query_fails(self):
         self.configure_monitor(auto_disable=False,interval_minutes=10,idle_backoff=True)
         self.host.usage_error=True;self.due()

@@ -18,6 +18,10 @@ use tokio::sync::Mutex;
 const MINUTE: u64 = 60_000;
 const DAY: u64 = 1440 * MINUTE;
 const OFFSET: u64 = 480 * MINUTE;
+const MAX_IDLE_BACKOFF_STEPS: u8 = 3;
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
 fn day(now: u64) -> u64 {
     now.saturating_add(OFFSET) / DAY
 }
@@ -235,6 +239,8 @@ pub struct AccountState {
     pub active: Option<ActiveRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_deferred_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub idle_backoff_level: u8,
 }
 impl AccountState {
     fn today(&self, now: u64) -> u64 {
@@ -243,6 +249,18 @@ impl AccountState {
         } else {
             0
         }
+    }
+    fn idle_level(&self) -> u8 {
+        if self.idle_deferred_since_ms.is_some() {
+            // 兼容 v0.12.0 仅保存 idle_deferred_since_ms 的旧状态，视作已翻倍1次。
+            self.idle_backoff_level.clamp(1, MAX_IDLE_BACKOFF_STEPS)
+        } else {
+            0
+        }
+    }
+    fn reset_idle_backoff(&mut self) {
+        self.idle_deferred_since_ms = None;
+        self.idle_backoff_level = 0;
     }
     fn reset_confirmation(&mut self) {
         self.streak = 0;
@@ -443,29 +461,29 @@ impl Monitor {
             if !state.settings.account_ids.contains(id) {
                 continue;
             }
-            let reason = if !state.settings.scheduled {
-                "未启用"
+            let reason: std::borrow::Cow<'static, str> = if !state.settings.scheduled {
+                "未启用".into()
             } else if state.paused || status.paused {
-                "已暂停"
+                "已暂停".into()
             } else if status.action == "disabled" {
-                "已自动停用，需人工恢复"
+                "已自动停用，需人工恢复".into()
             } else if status.active.is_some() {
-                "执行中或结果未确认"
+                "执行中或结果未确认".into()
             } else if status.daily_runs >= u64::from(state.settings.daily_max) {
-                "今日已达上限"
+                "今日已达上限".into()
             } else if state
                 .settings
                 .quiet_hours
                 .as_ref()
                 .is_some_and(|q| q.release(now) > now)
             {
-                "不测试时段"
+                "不测试时段".into()
             } else if status.confirm_due_ms.is_some() {
-                "等待确认复测"
-            } else if state.settings.idle_backoff && status.idle_deferred_since_ms.is_some() {
-                "空闲延长等待"
+                "等待确认复测".into()
+            } else if state.settings.idle_backoff && status.idle_level() > 0 {
+                format!("空闲延长（{}倍）", 1u32 << status.idle_level()).into()
             } else {
-                "等待常规测试"
+                "等待常规测试".into()
             };
             let due = status.confirm_due_ms.unwrap_or(status.next_due_ms).max(now);
             let next = (state.settings.scheduled
@@ -588,7 +606,7 @@ impl Monitor {
         // 计数和停用审计与设置代次分离，保存、移除后重新选择都不能清掉当日额度。
         for status in state.accounts.values_mut() {
             status.reset_confirmation();
-            status.idle_deferred_since_ms = None;
+            status.reset_idle_backoff();
         }
         for id in &state.settings.account_ids {
             state.accounts.entry(id.clone()).or_default().next_due_ms =
@@ -682,7 +700,7 @@ impl Monitor {
             for id in ids {
                 if let Some(status) = state.accounts.get_mut(&id) {
                     status.reset_confirmation();
-                    status.idle_deferred_since_ms = None;
+                    status.reset_idle_backoff();
                     if !request.paused {
                         status.next_due_ms =
                             now_ms() + u64::from(state.settings.interval_minutes) * MINUTE;
@@ -779,7 +797,7 @@ impl Monitor {
                 == record.metrics.get("client_key_id").and_then(Value::as_str);
         status.streak = 0;
         status.confirm_due_ms = None;
-        status.idle_deferred_since_ms = None;
+        status.reset_idle_backoff();
         status.next_due_ms = now + u64::from(state.settings.interval_minutes) * MINUTE;
         let policy = state.settings.degradation_policy;
         let threshold = policy.threshold();
@@ -882,7 +900,7 @@ impl Monitor {
                     }
                     // 延长等待期间出现新请求记录时，恢复常规间隔并允许本轮立即执行。
                     if !state.settings.idle_backoff {
-                        status.idle_deferred_since_ms = None;
+                        status.reset_idle_backoff();
                     } else if did_usage_phase
                         && state.settings.scheduled
                         && !state.paused
@@ -902,7 +920,7 @@ impl Monitor {
                             .flatten()
                             == Some(true)
                     {
-                        status.idle_deferred_since_ms = None;
+                        status.reset_idle_backoff();
                         status.next_due_ms = deferred_at.min(now);
                         restored.insert((task.id.clone(), id.clone()));
                     }
@@ -958,14 +976,17 @@ impl Monitor {
                     let status = &task.state.accounts[id];
                     if task.state.settings.idle_backoff
                         && status.confirm_due_ms.is_none()
-                        && status.idle_deferred_since_ms.is_none()
+                        && status.idle_level() < MAX_IDLE_BACKOFF_STEPS
                     {
                         let interval = u64::from(task.state.settings.interval_minutes) * MINUTE;
+                        let start = status
+                            .idle_deferred_since_ms
+                            .unwrap_or_else(|| now.saturating_sub(interval));
                         due_plan.push((
                             task.id.clone(),
                             task.state.generation.clone(),
                             id.clone(),
-                            now.saturating_sub(interval),
+                            start,
                         ));
                     }
                 }
@@ -1018,9 +1039,10 @@ impl Monitor {
                 let state = &mut task.state;
                 let interval = u64::from(state.settings.interval_minutes) * MINUTE;
                 let status = state.accounts.get_mut(&id).unwrap();
+                let level = status.idle_level();
                 if status.confirm_due_ms.is_none()
                     && state.settings.idle_backoff
-                    && status.idle_deferred_since_ms.is_none()
+                    && level < MAX_IDLE_BACKOFF_STEPS
                     && !restored.contains(&(task.id.clone(), id.clone()))
                     && due_results
                         .get(&(task.id.clone(), state.generation.clone(), id.clone()))
@@ -1028,9 +1050,11 @@ impl Monitor {
                         .flatten()
                         == Some(false)
                 {
-                    // 最近一个间隔内无请求，本轮不发探针、不计次数，最多延长至2倍间隔。
+                    // 最近周期内无请求，本轮不发探针、不计次数，逐级翻倍（2倍/4倍/8倍），最多翻倍3次。
+                    let delay = interval.saturating_mul(1u64 << level);
                     status.idle_deferred_since_ms = Some(now);
-                    status.next_due_ms = now + interval;
+                    status.idle_backoff_level = level + 1;
+                    status.next_due_ms = now.saturating_add(delay);
                     continue;
                 }
                 selected = Some((index, id));
@@ -1045,7 +1069,7 @@ impl Monitor {
             let status = state.accounts.get_mut(&id).unwrap();
             let request_id = uuid::Uuid::new_v4().to_string();
             let confirmation = status.confirm_due_ms.take().is_some();
-            status.idle_deferred_since_ms = None;
+            status.reset_idle_backoff();
             status.active = Some(ActiveRun {
                 id: request_id.clone(),
                 started_ms: now,
@@ -1225,6 +1249,7 @@ mod tests {
                     status.last_checked_ms = Some(u64::MAX);
                     status.confirm_due_ms = Some(u64::MAX);
                     status.idle_deferred_since_ms = Some(u64::MAX);
+                    status.idle_backoff_level = MAX_IDLE_BACKOFF_STEPS;
                     status.action = "unconfirmed".into();
                     status.action_detail = "错".repeat(120);
                     status.active = Some(ActiveRun {
@@ -1285,5 +1310,14 @@ mod tests {
         status.count(now + DAY);
         assert_eq!(status.daily_runs, 1);
         assert_eq!(status.total_runs, 2);
+        // 兼容 v0.12.0 仅存 idle_deferred_since_ms 的旧状态，并限制最大翻倍级数。
+        status.idle_deferred_since_ms = Some(now);
+        status.idle_backoff_level = 0;
+        assert_eq!(status.idle_level(), 1);
+        status.idle_backoff_level = 9;
+        assert_eq!(status.idle_level(), MAX_IDLE_BACKOFF_STEPS);
+        status.reset_idle_backoff();
+        assert_eq!(status.idle_level(), 0);
+        assert_eq!(status.idle_deferred_since_ms, None);
     }
 }
